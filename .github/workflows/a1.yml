@@ -38,11 +38,13 @@ jobs:
 
       - name: run
         run: |
+          ok=0
           for i in 1 2 3; do
-            python r1.py && break
+            if python r1.py; then ok=1; break; fi
             echo "attempt $i failed, waiting 300s"
             sleep 300
           done
+          [ "$ok" = "1" ] || { echo "job script failed after 3 attempts"; exit 1; }
         env:
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           PRIVATE_RAW_URL: ${{ secrets.PRIVATE_RAW_URL }}
