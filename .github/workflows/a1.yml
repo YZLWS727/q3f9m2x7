@@ -37,7 +37,12 @@ jobs:
           echo "::add-mask::$M5"
 
       - name: run
-        run: python r1.py
+        run: |
+          for i in 1 2 3; do
+            python r1.py && break
+            echo "attempt $i failed, waiting 300s"
+            sleep 300
+          done
         env:
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           PRIVATE_RAW_URL: ${{ secrets.PRIVATE_RAW_URL }}
