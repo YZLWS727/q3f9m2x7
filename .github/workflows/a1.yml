@@ -2,7 +2,7 @@ name: a1
 
 on:
   schedule:
-    - cron: '0 19 * * *'
+    - cron: '2 16 * * *'
   workflow_dispatch:
 
 jobs:
@@ -50,6 +50,10 @@ jobs:
           OUTPUT_SUFFIX: ${{ secrets.OUTPUT_SUFFIX }}
           PHASE: crawl
 
+      - name: rclone
+        if: always()
+        run: curl https://rclone.org/install.sh | sudo bash
+
       - name: raw backup
         if: always()
         env:
@@ -67,10 +71,6 @@ jobs:
           RAW_KEY: ${{ secrets.RAW_KEY }}
         run: |
           rclone lsl s3-cst:$S3_BUCKET/raw-backup | grep -F "$RAW_KEY" >/dev/null && echo "raw ok" || { echo "raw missing"; exit 1; }
-
-      - name: rclone
-        if: always()
-        run: curl https://rclone.org/install.sh | sudo bash
 
       - name: sync
         if: always()
