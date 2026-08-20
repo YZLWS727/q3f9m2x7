@@ -72,7 +72,11 @@ jobs:
           endpoint = $S3_ENDPOINT
           acl = private
           EOF
-          rclone copy ./output s3-cst:$S3_BUCKET --include "$OUT_FILE_PATTERN" --exclude "$RAW_EXCLUDE_PATTERN" --quiet
+          for i in 1 2 3; do
+            rclone copy ./output s3-cst:$S3_BUCKET --include "$OUT_FILE_PATTERN" --exclude "$RAW_EXCLUDE_PATTERN" --quiet && break
+            echo "sync attempt $i failed, waiting 60s"
+            sleep 60
+          done
 
       - name: verify
         if: always()
