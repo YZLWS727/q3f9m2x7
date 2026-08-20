@@ -81,7 +81,11 @@ jobs:
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
         run: |
-          rclone copy ./output s3-cst:$S3_BUCKET/raw-backup --include "*" --quiet
+          for i in 1 2 3; do
+            rclone copy ./output s3-cst:$S3_BUCKET/raw-backup --include "*" --quiet && break
+            echo "raw backup attempt $i failed, waiting 60s"
+            sleep 60
+          done
 
       - name: raw verify
         if: always()
@@ -89,4 +93,9 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
           BJ_DATE=$(TZ=Asia/Shanghai date -d 'yesterday' +%Y%m%d)
-          rclone lsl s3-cst:$S3_BUCKET/raw-backup | grep -F "$BJ_DATE" >/dev/null && echo "raw ok $BJ_DATE" || { echo "raw missing $BJ_DATE"; exit 1; }
+          for i in 1 2 3; do
+            rclone lsl s3-cst:$S3_BUCKET/raw-backup | grep -F "$BJ_DATE" >/dev/null && echo "raw ok $BJ_DATE" && break
+            echo "raw verify attempt $i failed, waiting 60s"
+            sleep 60
+            if [ $i -eq 3 ]; then echo "raw missing $BJ_DATE"; exit 1; fi
+          done
