@@ -42,11 +42,13 @@ jobs:
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           PHASE: label
         run: |
+          ok=0
           for i in 1 2 3; do
-            python r1.py && break
+            if python r1.py; then ok=1; break; fi
             echo "attempt $i failed, waiting 300s"
             sleep 300
           done
+          [ "$ok" = "1" ] || { echo "job script failed after 3 attempts"; exit 1; }
 
       - name: rclone
         if: always()
