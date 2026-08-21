@@ -14,12 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: enable a2
-        run: |
-          gh api -X PUT repos/${{ github.repository }}/actions/workflows/a2.yml/enable || echo "enable a2 failed（不阻塞抓取，下一轮 a1 会重试）"
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: deps
         run: |
           python -m pip install --upgrade pip
