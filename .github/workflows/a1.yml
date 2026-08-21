@@ -24,12 +24,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests playwright
+        timeout-minutes: 10
 
       - name: chromium
         run: |
           sudo apt-get update -qq
           python -m playwright install --with-deps chromium
-        timeout-minutes: 10
+        timeout-minutes: 15
 
       - name: mask
         env:
@@ -46,6 +47,7 @@ jobs:
           echo "::add-mask::$M5"
 
       - name: run
+        timeout-minutes: 60
         run: |
           ok=0
           for i in 1 2 3; do
@@ -71,11 +73,29 @@ jobs:
             git add raw/
             if ! git diff --cached --quiet; then
               git commit -m "raw: $(TZ=Asia/Shanghai date +%Y%m%d) 原始抓取备份"
-              git pull --rebase --autostash || true
-              git push
+              okp=0
+              for i in 1 2 3; do
+                git pull --rebase --autostash || true
+                if git push; then okp=1; break; fi
+                echo "raw push attempt $i failed, waiting 30s"
+                sleep 30
+              done
+              [ "$okp" = "1" ] || { echo "raw commit push failed after 3 attempts"; exit 1; }
             else
               echo "raw already committed"
             fi
           else
             echo "no raw file to commit"
           fi
+
+      - name: set raw date
+        id: rawdate
+        run: echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: upload raw artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ steps.rawdate.outputs.date }}
+          path: raw/*原始未打标*
+          if-no-files-found: ignore
