@@ -2,7 +2,7 @@ name: a1
 
 on:
   schedule:
-    - cron: '2 16 * * *'
+    - cron: '10 16 * * *'
   workflow_dispatch:
 
 jobs:
@@ -101,3 +101,4 @@ jobs:
           name: raw-${{ steps.rawdate.outputs.date }}
           path: raw/*原始未打标*
           if-no-files-found: ignore
+          overwrite: true
