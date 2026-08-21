@@ -258,6 +258,18 @@ def item_ok(r):
         r.get("summary_title", "").strip() and r.get("sentiment") in ("Positive", "Negative", "Neutral")
 
 
+def title_consistent(r, rich_text):
+    """标题-正文一致性守卫：标题与正文应至少共享一个内容 2-gram。
+    用于拦截模型 idx 错位导致的‘标题/标签挂到别的新闻上’。"""
+    t = re.sub(r"\s+", "", (r or {}).get("summary_title", ""))
+    if len(t) < 6:
+        return True
+    tb = {t[i:i + 2] for i in range(len(t) - 1)}
+    tb = {b for b in tb if any(c.isalnum() or '\u4e00' <= c <= '\u9fff' for c in b)}
+    body = re.sub(r"\s+", "", rich_text or "")
+    return any(b in body for b in tb)
+
+
 def try_model(model, extra, key, batch, counters):
     sys_prompt, user_content = build_prompt(batch)
     st, body, dt = call_api(model, key, sys_prompt, user_content, extra, counters)
@@ -278,13 +290,16 @@ def process_batch(bi, batch, key, counters):
     res_q, meta_q = try_model(MODEL_QWEN3, {"enable_thinking": False}, key, batch, counters)
     res_g, meta_g = try_model(MODEL_GLM9B, None, key, batch, counters)
     merged = {}
+    title_mismatch = 0
     for i, it in enumerate(batch):
         q, g = (res_q or {}).get(i), (res_g or {}).get(i)
         chosen, src = None, None
-        if item_ok(q):
+        if item_ok(q) and title_consistent(q, it["rich_text"]):
             chosen, src = q, MODEL_QWEN3
-        elif item_ok(g):
+        elif item_ok(g) and title_consistent(g, it["rich_text"]):
             chosen, src = g, MODEL_GLM9B
+        elif item_ok(q) or item_ok(g):
+            title_mismatch += 1
         if chosen:
             merged[it["id"]] = dict(chosen)
             merged[it["id"]]["_model"] = src
@@ -301,10 +316,11 @@ def process_batch(bi, batch, key, counters):
                                         {"enable_thinking": False}, counters)
                 if st == 200:
                     r2, err2 = parse_result(body, 1)
-                    if r2 and 0 in r2 and item_ok(r2[0]):
+                    if r2 and 0 in r2 and item_ok(r2[0]) and title_consistent(r2[0], it["rich_text"]):
                         merged[it["id"]] = dict(r2[0])
                         merged[it["id"]]["_model"] = MODEL_QWEN3 + "-single"
                         break
+                title_mismatch += 1
                 time.sleep(1)
 
     dead = [iid for iid in ids if iid not in merged]
@@ -326,6 +342,7 @@ def process_batch(bi, batch, key, counters):
             "qwen_items": {str(i): r for i, r in (res_q or {}).items()},
             "glm9b_items": {str(i): r for i, r in (res_g or {}).items()},
             "merged": merged, "dead": dead, "qwen_meta": meta_q, "glm_meta": meta_g,
+            "title_mismatch": title_mismatch,
             "agree": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in agree.items()},
             "done": True}
 
