@@ -17,6 +17,11 @@ on:
         description: '运行时长上限（分钟），默认 330'
         required: false
         default: '330'
+      force_rerun:
+        description: '强制重跑（忽略检查点与成品存在性，出干净基准）'
+        required: false
+        default: false
+        type: boolean
   workflow_run:
     workflows: ["a1"]
     types: [completed]
@@ -71,7 +76,7 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
-        run: python a3_label.py
+        run: python a3_label.py ${{ inputs.force_rerun == 'true' && '--fresh' || '' }}
 
       - name: upload a3 artifacts
         if: always()
