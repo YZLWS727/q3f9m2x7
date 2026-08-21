@@ -47,7 +47,7 @@ jobs:
           echo "::add-mask::$M5"
 
       - name: run
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           ok=0
           for i in 1 2 3; do
@@ -89,11 +89,13 @@ jobs:
           fi
 
       - name: set raw date
+        if: always()
         id: rawdate
         run: echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: upload raw artifact
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: raw-${{ steps.rawdate.outputs.date }}
