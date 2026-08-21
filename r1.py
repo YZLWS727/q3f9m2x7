@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
 
@@ -19,8 +20,20 @@ def main():
         req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github.raw+json")
     req.add_header("User-Agent", "ok")
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = resp.read()
+    data = None
+    last = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+            break
+        except Exception as e:
+            last = e
+            print(f"download attempt {attempt} failed: {e!r}")
+            time.sleep(5)
+    if data is None:
+        print("private script download failed after 3 attempts:", repr(last)[:200])
+        return 2
     with open(target, "wb") as f:
         f.write(data)
     env = dict(os.environ)
