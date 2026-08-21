@@ -91,7 +91,10 @@ jobs:
       - name: set raw date
         if: always()
         id: rawdate
-        run: echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+        run: |
+          F=$(ls raw/*原始未打标* 2>/dev/null | head -1)
+          D=$(basename "$F" | cut -c1-8)
+          if [[ "$D" =~ ^[0-9]{8}$ ]]; then echo "date=$D" >> "$GITHUB_OUTPUT"; else echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"; fi
 
       - name: upload raw artifact
         if: always()
