@@ -1,0 +1,21 @@
+name: a2-watch
+
+on:
+  schedule:
+    - cron: '17 17-23,0-15 * * *'
+    - cron: '47 17-23,0-15 * * *'
+  workflow_dispatch:
+
+jobs:
+  ensure-a2:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ensure a2 alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/a2_watch.py
