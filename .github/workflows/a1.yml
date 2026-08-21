@@ -10,8 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: enable a2
+        run: gh api -X PUT repos/${{ github.repository }}/actions/workflows/a2.yml/enable
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: deps
         run: |
