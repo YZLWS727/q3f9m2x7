@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           python -m playwright install --with-deps chromium
-        timeout-minutes: 5
+        timeout-minutes: 10
 
       - name: mask
         env:
@@ -46,7 +46,6 @@ jobs:
           done
           [ "$ok" = "1" ] || { echo "job script failed after 3 attempts"; exit 1; }
         env:
-          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           PRIVATE_RAW_URL: ${{ secrets.PRIVATE_RAW_URL }}
           READ_TOKEN: ${{ secrets.READ_TOKEN }}
           OUTPUT_SUFFIX: ${{ secrets.OUTPUT_SUFFIX }}
