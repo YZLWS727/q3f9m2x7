@@ -92,7 +92,8 @@ jobs:
         if: always()
         id: rawdate
         run: |
-          F=$(ls raw/*原始未打标* 2>/dev/null | head -1)
+          # 只认本次运行刚生成的 ./output 文件，不能从 raw/ 取（checkout 会带历史 raw）
+          F=$(ls ./output/*原始未打标* 2>/dev/null | head -1)
           D=$(basename "$F" | cut -c1-8)
           if [[ "$D" =~ ^[0-9]{8}$ ]]; then echo "date=$D" >> "$GITHUB_OUTPUT"; else echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"; fi
 
@@ -102,6 +103,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: raw-${{ steps.rawdate.outputs.date }}
-          path: raw/*原始未打标*
+          path: ./output/*原始未打标*
           if-no-files-found: ignore
           overwrite: true
