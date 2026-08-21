@@ -495,7 +495,8 @@ def main():
     args = sys.argv[1:]
     limit = None
     fresh = False
-    time_budget_min = int(os.environ.get("TIME_BUDGET_MIN", str(DEFAULT_TIME_BUDGET_MIN)))
+    _budget_raw = os.environ.get("TIME_BUDGET_MIN", "").strip()
+    time_budget_min = int(_budget_raw) if _budget_raw else DEFAULT_TIME_BUDGET_MIN
     out_dir = os.environ.get("OUT_DIR", "./output-a3")
     skip_s3 = os.environ.get("A3_SKIP_S3", "0") == "1"
     i = 0
