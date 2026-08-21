@@ -49,57 +49,8 @@ jobs:
           PRIVATE_RAW_URL: ${{ secrets.PRIVATE_RAW_URL }}
           READ_TOKEN: ${{ secrets.READ_TOKEN }}
           OUTPUT_SUFFIX: ${{ secrets.OUTPUT_SUFFIX }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           PHASE: crawl
-
-      - name: rclone
-        if: always()
-        run: curl https://rclone.org/install.sh | sudo bash
-
-      - name: rclone config
-        if: always()
-        env:
-          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
-        run: |
-          mkdir -p ~/.config/rclone
-          cat <<EOF > ~/.config/rclone/rclone.conf
-          [s3-cst]
-          type = s3
-          provider = Other
-          access_key_id = $S3_ACCESS_KEY
-          secret_access_key = $S3_SECRET_KEY
-          endpoint = $S3_ENDPOINT
-          acl = private
-          EOF
-
-      - name: raw backup
-        if: always()
-        env:
-          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
-        run: |
-          ok=0
-          for i in 1 2 3 4 5; do
-            if rclone copy ./output s3-cst:$S3_BUCKET/raw-backup --include "*" --quiet; then ok=1; break; fi
-            echo "raw backup attempt $i failed, waiting 60s"
-            sleep 60
-          done
-          [ "$ok" = "1" ] || { echo "raw backup failed after 5 attempts"; exit 1; }
-
-      - name: raw verify
-        if: always()
-        env:
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-        run: |
-          BJ_DATE=$(TZ=Asia/Shanghai date -d 'yesterday' +%Y%m%d)
-          ok=0
-          for i in 1 2 3 4 5; do
-            if rclone lsl s3-cst:$S3_BUCKET/raw-backup | grep -F "$BJ_DATE" >/dev/null; then ok=1; echo "raw ok $BJ_DATE"; break; fi
-            echo "raw verify attempt $i failed, waiting 60s"
-            sleep 60
-          done
-          [ "$ok" = "1" ] || { echo "raw missing $BJ_DATE after 5 attempts"; exit 1; }
