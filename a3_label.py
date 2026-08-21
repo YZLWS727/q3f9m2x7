@@ -6,6 +6,7 @@
 注意：TAGS_DEF 与生产脚本同步维护；a2 正在使用智谱，本脚本不调用智谱/DeepSeek。
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -389,16 +390,13 @@ def s3_request(method, key, body=None, query="", content_type=None, cfg=None):
                      hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
 
     def sign(k, msg):
-        h = hashlib.new("sha256", k)
-        h.update(msg.encode("utf-8"))
-        return h.digest()
+        return hmac.new(k, msg.encode("utf-8"), hashlib.sha256).digest()
 
     kd = sign(("AWS4" + cfg["secret_key"]).encode(), datestamp)
     kr = sign(kd, cfg["region"])
     ks = sign(kr, "s3")
     ksg = sign(ks, "aws4_request")
-    sig = hashlib.new("sha256", ksg)
-    sig.update(sts.encode("utf-8"))
+    sig = hmac.new(ksg, sts.encode("utf-8"), hashlib.sha256)
     auth = (f"AWS4-HMAC-SHA256 Credential={cfg['access_key']}/{scope}, "
             f"SignedHeaders={signed_headers}, Signature={sig.hexdigest()}")
     url = f"{endpoint}{path}" + (f"?{query}" if query else "")
