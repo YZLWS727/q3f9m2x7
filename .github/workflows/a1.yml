@@ -2,7 +2,7 @@ name: a1
 
 on:
   schedule:
-    - cron: '10 16 * * *'
+    - cron: '2 16 * * *'
   workflow_dispatch:
 
 jobs:
@@ -86,7 +86,6 @@ jobs:
         if: always()
         id: rawdate
         run: |
-          # 只认本次运行刚生成的 ./output 文件，不能从 raw/ 取（checkout 会带历史 raw）
           F=$(ls ./output/*原始未打标* 2>/dev/null | head -1)
           D=$(basename "$F" | cut -c1-8)
           if [[ "$D" =~ ^[0-9]{8}$ ]]; then echo "date=$D" >> "$GITHUB_OUTPUT"; else echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"; fi
