@@ -5,6 +5,8 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  schedule:
+    - cron: '5 1,17,18,19,21,23 * * *'
   workflow_dispatch:
     inputs:
       target_date:
@@ -15,10 +17,14 @@ on:
         description: '运行时长上限（分钟），默认 330'
         required: false
         default: '330'
+  workflow_run:
+    workflows: ["a1"]
+    types: [completed]
 
 jobs:
   label:
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: read
       actions: read
@@ -31,19 +37,34 @@ jobs:
 
       - name: resolve raw
         id: raw
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -n "${{ inputs.target_date }}" ]; then D="${{ inputs.target_date }}"; else D=$(TZ=Asia/Shanghai date -d "yesterday" +%Y%m%d); fi
           F=$(ls raw/*${D}*原始未打标*.md 2>/dev/null | head -1)
-          if [ -z "$F" ]; then echo "RAW_NOT_FOUND for $D"; ls raw/ | tail -5; exit 1; fi
+          if [ -z "$F" ]; then
+            echo "RAW_NOT_FOUND for $D"
+            C=$(gh api "repos/${{ github.repository }}/actions/workflows/a1.yml/runs?per_page=1" --jq '.workflow_runs[0].conclusion' 2>/dev/null || echo "unknown")
+            echo "A1_LAST_CONCLUSION=$C"
+            if [ "$C" = "success" ]; then
+              echo "A1 ok but raw not yet -> RETRY_LATER"
+              exit 0
+            fi
+            ls raw/ | tail -5
+            exit 1
+          fi
           echo "date=$D" >> "$GITHUB_OUTPUT"
           echo "raw=$F" >> "$GITHUB_OUTPUT"
 
       - name: run a3 label
+        if: steps.raw.outputs.raw != ''
         timeout-minutes: 350
         env:
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
           TARGET_DATE: ${{ steps.raw.outputs.date }}
           RAW_PATH: ${{ steps.raw.outputs.raw }}
+          RAW_DIR: raw
+          A3_EXPLICIT: ${{ inputs.target_date != '' && '1' || '0' }}
           OUT_DIR: ./output-a3
           TIME_BUDGET_MIN: ${{ inputs.time_budget_min }}
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
