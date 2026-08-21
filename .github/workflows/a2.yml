@@ -1,5 +1,9 @@
 name: a2
 
+concurrency:
+  group: infoflow-label
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: '0 17,23,5,11 * * *'
@@ -74,13 +78,17 @@ jobs:
           endpoint = $S3_ENDPOINT
           acl = private
           EOF
-          ok=0
-          for i in 1 2 3 4 5; do
-            if rclone copy ./output s3-cst:$S3_BUCKET --include "$OUT_FILE_PATTERN" --exclude "$RAW_EXCLUDE_PATTERN" --quiet; then ok=1; break; fi
-            echo "sync attempt $i failed, waiting 60s"
-            sleep 60
-          done
-          [ "$ok" = "1" ] || { echo "sync failed after 5 attempts"; exit 1; }
+          if [ -d ./output ]; then
+            ok=0
+            for i in 1 2 3 4 5; do
+              if rclone copy ./output s3-cst:$S3_BUCKET --filter "+ $OUT_FILE_PATTERN" --filter "- $RAW_EXCLUDE_PATTERN" --quiet; then ok=1; break; fi
+              echo "sync attempt $i failed, waiting 60s"
+              sleep 60
+            done
+            [ "$ok" = "1" ] || { echo "sync failed after 5 attempts"; exit 1; }
+          else
+            echo "no output dir yet（打标未产出成品，等待下一窗口续跑）"
+          fi
 
       - name: verify
         if: always()
@@ -88,4 +96,9 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
           OUT_FILE_KEY: ${{ secrets.OUT_FILE_KEY }}
         run: |
-          rclone lsl s3-cst:$S3_BUCKET | grep -F "$OUT_FILE_KEY" >/dev/null && echo "ok" || { echo "missing"; exit 1; }
+          TARGET_DATE=$(TZ=Asia/Shanghai date -d 'yesterday' +%Y%m%d)
+          if rclone lsl s3-cst:$S3_BUCKET | grep -F "$TARGET_DATE" | grep -F "$OUT_FILE_KEY" >/dev/null; then
+            echo "DONE $TARGET_DATE 成品已同步到时间胶囊桶"
+          else
+            echo "PENDING $TARGET_DATE 成品未完成（打标续跑中，属正常状态，看 run 步骤 PROGRESS）"
+          fi
