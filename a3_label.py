@@ -7,6 +7,7 @@
 """
 import hashlib
 import hmac
+import glob
 import json
 import os
 import re
@@ -159,16 +160,22 @@ def build_prompt(batch):
 6. 输出前逐条自检：每条标签数必须在 4~6 之间，不足 4 个立即补足后再输出。
 
 【情绪判定纪律】
-sentiment 按新闻事实判断：
-1. 有明确利空信号（重大自然灾害致灾/人员伤亡、地缘冲突升级、重大违约/暴跌/衰退等）→ Negative；
-2. 有明确利好信号（重大政策利好、显著增长/创新高/评级上调/重大突破等）→ Positive；
-3. 无明显利好利空、信息中性或好坏参半 → Neutral（中性优先）；不因主体知名度、行业偏好或叙事语气偏向。
+sentiment 必须按新闻事实明确判断：
+1. 有明确利空信号（重大自然灾害致灾/人员伤亡、地缘冲突升级、重大违约/暴跌/衰退/评级下调/出口下滑等）→ Negative；
+2. 有明确利好信号（重大政策利好、显著增长/创新高/评级上调/突破/回升/获批等）→ Positive；
+3. 仅当信息确实中性、好坏参半或证据不足时才用 Neutral；有方向性事实必须判断：市场上涨/下跌、政策支持/收紧、数据改善/恶化、评级上调/下调、冲突升级/缓和、灾害损失等 → 分别映射 Positive/Negative，
+不得因“没提涨跌”就默认中性；不因主体知名度或语气偏向。
 
 《预设标签库》：
 {tags_context_str}
 
-仅返回纯 JSON 数组，禁止任何 markdown 标记。格式示例：
-[ {{"idx": 0, "summary_title": "精炼标题", "tags": ["#美国", "#债务和债券市场", "#金融流动性", "#宏观政策"], "sentiment": "Neutral"}} ]"""
+summary_title 为 20~30 字的一句话标题，必须保留主体、关键数字（原文有数字时必须包含）与事件核心，禁止编造原文没有的事实。仅返回纯 JSON 数组，禁止任何 markdown 标记。格式示例：
+[ {{"idx": 0, "summary_title": "国内商品期货开盘多数上涨 铂、沪银、乙二醇涨超4%", "tags": ["#美国", "#债务和债券市场", "#金融流动性", "#宏观政策"], "sentiment": "Neutral"}} ]
+
+【输出前强制检查】
+①每条标签数必须 4~6 个，不足 4 个立即从《预设标签库》补足；
+②sentiment 必须为 Positive/Negative/Neutral 三选一，不得省略；
+③summary_title 必须 20~30 字且不得编造原文没有的事实。"""
     user_payload = [{"idx": i, "text": item["rich_text"]} for i, item in enumerate(batch)]
     return system_prompt, json.dumps(user_payload, ensure_ascii=False)
 
@@ -443,6 +450,19 @@ def s3_get_optional(key):
         return None
 
 
+def s3_list_keys(prefix):
+    query = "list-type=2&prefix=" + urllib.parse.quote(prefix, safe="")
+    _, xml = s3_request("GET", "", query=query)
+    return re.findall(r"<Key>([^<]+)</Key>", xml.decode("utf-8", "replace"))
+
+
+def find_raw(raw_dir, date_str):
+    if not raw_dir or not os.path.isdir(raw_dir):
+        return None
+    hits = glob.glob(os.path.join(raw_dir, f"*{date_str}*原始未打标*.md"))
+    return sorted(hits)[-1] if hits else None
+
+
 def main():
     args = sys.argv[1:]
     limit = None
@@ -464,22 +484,58 @@ def main():
             i += 1
 
     raw_path = os.environ.get("RAW_PATH", "")
+    raw_dir = os.environ.get("RAW_DIR", "")
     target_date = os.environ.get("TARGET_DATE", "")
+    explicit = os.environ.get("A3_EXPLICIT", "0") == "1"
     key = os.environ.get("SILICONFLOW_API_KEY", "")
-    if not raw_path or not os.path.exists(raw_path):
-        log("RAW_PATH_MISSING", raw_path)
-        return 2
     if not key:
         log("SILICONFLOW_API_KEY_MISSING")
         return 2
     if not target_date:
-        m = re.search(r"(\d{8})", os.path.basename(raw_path))
+        m = re.search(r"(\d{8})", os.path.basename(raw_path or ""))
         target_date = m.group(1) if m else ""
+    if not raw_path and raw_dir:
+        raw_path = find_raw(raw_dir, target_date) or ""
+    if not raw_path or not os.path.exists(raw_path):
+        log("RAW_NOT_FOUND", target_date, "raw_dir", raw_dir)
+        return 2
     if not target_date:
         log("TARGET_DATE_MISSING")
         return 2
 
     date_tag = date_tag_from_path(raw_path, target_date)
+
+    # 自动优先续跑未完成旧日期（仅定时/接力触发；手动 dispatch 显式指定时不覆盖）
+    if not skip_s3 and not fresh and not explicit:
+        try:
+            keys = s3_list_keys("checkpoint-a3/")
+            old = None
+            for k in keys:
+                m = re.match(r"checkpoint-a3/(\d{8}周[一二三四五六日天])-ckpt\.json$", k)
+                if not m:
+                    continue
+                cand = m.group(1)
+                if cand >= date_tag:
+                    continue
+                try:
+                    stx, _ = s3_request("GET", f"{cand}全网宏观信息流-硅基流动.md")
+                    incomplete = stx != 200
+                except urllib.error.HTTPError as e:
+                    incomplete = e.code in (404, 403)
+                except Exception:
+                    incomplete = False
+                if incomplete and (old is None or cand > old):
+                    old = cand
+            if old:
+                old_raw = find_raw(raw_dir, old)
+                if old_raw:
+                    log("RESUME_OLD_DATE", old, "->", old_raw)
+                    raw_path = old_raw
+                    target_date = old
+                    date_tag = old
+        except Exception as e:
+            log("AUTO_RESUME_SCAN_ERR", repr(e))
+
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.json")
     s3_ckpt_key = f"checkpoint-a3/{date_tag}-ckpt.json"
@@ -497,7 +553,7 @@ def main():
     with open(raw_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             sha.update(chunk)
-    cfg = {"raw_sha": sha.hexdigest()[:16], "limit": limit, "prompt": "strong",
+    cfg = {"raw_sha": sha.hexdigest()[:16], "limit": limit, "prompt": "final",
            "batch_size": BATCH_SIZE, "models": [MODEL_QWEN3, MODEL_GLM9B],
            "date_tag": date_tag, "total": len(items)}
     total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -517,6 +573,19 @@ def main():
         cp = {"config": cfg, "batches": {}, "done_count": 0,
               "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "updated_at": ""}
         save_json(ckpt_path, cp)
+
+    # 幂等保护：S3 已有当日成品且非强制重跑 → 直接跳过（防止定时/workflow_run 重复触发重传）
+    if not skip_s3 and not fresh:
+        try:
+            st_exist, _ = s3_request("GET", f"{date_tag}全网宏观信息流-硅基流动.md")
+            if st_exist == 200:
+                log("ALREADY_DONE_SKIP", date_tag)
+                return 0
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 403):
+                log("S3_CHECK_ERR", repr(e))
+        except Exception as e:
+            log("S3_CHECK_ERR", repr(e))
 
     start_all = time.time()
     last_progress = time.time()
