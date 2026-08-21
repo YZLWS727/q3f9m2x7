@@ -393,13 +393,13 @@ def patch_md(text, items, results, failed_ids):
     return "\n".join(lines)
 
 
-def verify(text, expected_total):
+def verify(text, expected_total, baseline_dups=0):
     n_timeout = len(re.findall(r"^### AI解析超时暂存\s*$", text, flags=re.M))
     n_entries = len(re.findall(r"^### ", text, flags=re.M))
     ids = re.findall(r"\[id::\s*([^\]\s]+)", text)
     dup = len(ids) - len(set(ids))
-    log("VERIFY placeholders=%d entries=%d dup_ids=%d" % (n_timeout, n_entries, dup))
-    return n_timeout == 0 and n_entries == expected_total and dup == 0
+    log("VERIFY placeholders=%d entries=%d dup_ids=%d baseline_dups=%d" % (n_timeout, n_entries, dup, baseline_dups))
+    return n_timeout == 0 and n_entries == expected_total and dup <= baseline_dups
 
 
 # ---------------- 主流程 ----------------
@@ -496,7 +496,11 @@ def main():
     with open(os.path.join(out_dir, "repair_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
 
-    if not verify(new_text, len(entries)):
+    orig_ids = re.findall(r"\[id::\s*([^\]\s]+)", text)
+    baseline_dups = len(orig_ids) - len(set(orig_ids))
+    if baseline_dups:
+        log("NOTE_PRE_EXISTING_DUPS=%d" % baseline_dups)
+    if not verify(new_text, len(entries), baseline_dups):
         log("VERIFY_FAILED")
         return 3
 
