@@ -33,11 +33,27 @@ def main():
     runs = gh("GET", "/repos/%s/actions/workflows/a2.yml/runs?per_page=10" % repo)
     if runs is None:
         return 0
-    active = [r for r in runs.get("workflow_runs", []) if r.get("status") != "completed"]
+    items = runs.get("workflow_runs", [])
+    active = [r for r in items if r.get("status") != "completed"]
     if active:
         print("WATCH_SKIP_ACTIVE 已有 a2 活动运行:",
               [(r.get("id"), r.get("status")) for r in active])
         return 0
+    # 若最近一次 a2 刚完成（15 分钟内），说明接力正常，跳过派发避免多余空转
+    import datetime
+    for r in items:
+        if r.get("status") == "completed" and r.get("completed_at"):
+            try:
+                done = datetime.datetime.strptime(
+                    r["completed_at"], "%Y-%m-%dT%H:%M:%SZ")
+                now = datetime.datetime.utcnow()
+                if (now - done).total_seconds() < 15 * 60:
+                    print("WATCH_SKIP_RECENT 最近 a2 刚完成，无需派发:",
+                          r.get("id"), r.get("completed_at"))
+                    return 0
+            except Exception as e:
+                print("WATCH_TIME_ERR", repr(e)[:100])
+            break
     res = gh("POST", "/repos/%s/actions/workflows/a2.yml/dispatches" % repo,
              {"ref": "main"})
     print("WATCH_DISPATCH", "OK" if res is not None else "FAILED")
