@@ -24,6 +24,7 @@ DEFAULT_TIME_BUDGET_MIN = 330
 NO_PROGRESS_MIN = 30
 MODEL_QWEN3 = "Qwen/Qwen3-8B"
 MODEL_GLM9B = "THUDM/GLM-4-9B-0414"
+MODEL_GONE = False
 
 TAGS_DEF = {
     "#中国": "出现\"中国\"或与中国相关的各类新闻",
@@ -196,6 +197,11 @@ def call_api(model, key, sys_prompt, user_content, extra, counters):
             body = e.read().decode("utf-8", "replace")[:300]
             last = (e.code, body)
             counters["http"][str(e.code)] = counters["http"].get(str(e.code), 0) + 1
+            if e.code == 400 and ("20012" in body or "Model does not exist" in body):
+                global MODEL_GONE
+                MODEL_GONE = True
+                counters["model_gone"] = counters.get("model_gone", 0) + 1
+                return e.code, body, time.time() - t0
             if e.code in (429, 500, 502, 503, 504):
                 time.sleep(min(60, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
                 continue
@@ -540,6 +546,21 @@ def main():
 
         log(f"BATCH {bi}/{total_batches} START elapsed={int(time.time()-start_all)}s")
         rec = process_batch(bi, batch, key, counters)
+        if MODEL_GONE:
+            cp["batches"][str(bi)] = rec
+            cp["done_count"] += 1
+            cp["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_json(ckpt_path, cp)
+            alert = os.path.join(out_dir, "MODEL_GONE_ALERT.txt")
+            with open(alert, "w", encoding="utf-8") as f:
+                f.write("检测到硅基流动免费模型失效（400 code 20012 / Model does not exist）。\n"
+                        "时间：" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n"
+                        "模型：" + MODEL_QWEN3 + " / " + MODEL_GLM9B + "\n"
+                        "处置：登录硅基流动模型广场确认免费清单，更新 a3_label.py 的 MODEL_* 后重跑；"
+                        "或临时切回智谱 a2 / DeepSeek 兜底。\n")
+            log("MODEL_GONE_ABORT", "done", cp["done_count"], "/", total_batches)
+            exit_code = 2
+            break
         cp["batches"][str(bi)] = rec
         cp["done_count"] += 1
         cp["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
