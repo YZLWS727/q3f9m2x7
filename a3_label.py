@@ -401,6 +401,17 @@ def s3_cfg():
             "region": os.environ.get("S3_REGION", "cn-north-1")}
 
 
+def s3_cfg_aux():
+    """辅助桶（非成品：checkpoint-a3/、a3-reports/）；未配置时回退主桶=旧行为"""
+    if not os.environ.get("S3_AUX_BUCKET"):
+        return s3_cfg()
+    return {"endpoint": os.environ.get("S3_AUX_ENDPOINT", os.environ.get("S3_ENDPOINT", "")).rstrip("/"),
+            "bucket": os.environ.get("S3_AUX_BUCKET", ""),
+            "access_key": os.environ.get("S3_AUX_ACCESS_KEY", os.environ.get("S3_ACCESS_KEY", "")),
+            "secret_key": os.environ.get("S3_AUX_SECRET_KEY", os.environ.get("S3_SECRET_KEY", "")),
+            "region": os.environ.get("S3_AUX_REGION", os.environ.get("S3_REGION", "cn-north-1"))}
+
+
 def s3_request(method, key, body=None, query="", content_type=None, cfg=None):
     cfg = cfg or s3_cfg()
     endpoint = cfg["endpoint"]
@@ -442,11 +453,11 @@ def s3_request(method, key, body=None, query="", content_type=None, cfg=None):
         return r.status, r.read()
 
 
-def s3_put_retry(key, body, content_type, tries=4, wait=10):
+def s3_put_retry(key, body, content_type, tries=4, wait=10, cfg=None):
     last = None
     for i in range(1, tries + 1):
         try:
-            s3_request("PUT", key, body=body, content_type=content_type)
+            s3_request("PUT", key, body=body, content_type=content_type, cfg=cfg)
             return True
         except Exception as e:
             last = e
@@ -455,9 +466,9 @@ def s3_put_retry(key, body, content_type, tries=4, wait=10):
     raise last
 
 
-def s3_get_optional(key):
+def s3_get_optional(key, cfg=None):
     try:
-        _, data = s3_request("GET", key)
+        _, data = s3_request("GET", key, cfg=cfg)
         return data
     except urllib.error.HTTPError as e:
         if e.code in (404, 403):
@@ -467,9 +478,9 @@ def s3_get_optional(key):
         return None
 
 
-def s3_list_keys(prefix):
+def s3_list_keys(prefix, cfg=None):
     query = "list-type=2&prefix=" + urllib.parse.quote(prefix, safe="")
-    _, xml = s3_request("GET", "", query=query)
+    _, xml = s3_request("GET", "", query=query, cfg=cfg)
     return re.findall(r"<Key>([^<]+)</Key>", xml.decode("utf-8", "replace"))
 
 
@@ -525,7 +536,7 @@ def main():
     # 自动优先续跑未完成旧日期（仅定时/接力触发；手动 dispatch 显式指定时不覆盖）
     if not skip_s3 and not fresh and not explicit:
         try:
-            keys = s3_list_keys("checkpoint-a3/")
+            keys = s3_list_keys("checkpoint-a3/", s3_cfg_aux())
             old = None
             for k in keys:
                 m = re.match(r"checkpoint-a3/(\d{8}周[一二三四五六日天])-ckpt\.json$", k)
@@ -559,7 +570,7 @@ def main():
 
     if not fresh:
         if not skip_s3:
-            data = s3_get_optional(s3_ckpt_key)
+            data = s3_get_optional(s3_ckpt_key, s3_cfg_aux())
             if data:
                 with open(ckpt_path, "wb") as f:
                     f.write(data)
@@ -657,7 +668,8 @@ def main():
             dead_all[iid] = {"batch": bi, "reason": "failed"}
         disagree_all.extend(rec["agree"]["disagree"])
         if cp["done_count"] % 25 == 0 and not skip_s3:
-            s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(), "application/octet-stream")
+            s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(),
+                         "application/octet-stream", cfg=s3_cfg_aux())
         eta = (time.time() - start_all) / max(1, cp["done_count"]) * (total_batches - cp["done_count"])
         with open(os.path.join(out_dir, "progress.txt"), "w", encoding="utf-8") as f:
             f.write(f"done={cp['done_count']}/{total_batches} eta_sec={int(eta)}\n")
@@ -670,7 +682,8 @@ def main():
 
     if not skip_s3:
         try:
-            s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(), "application/octet-stream")
+            s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(),
+                         "application/octet-stream", cfg=s3_cfg_aux())
         except Exception as e:
             log("CKPT_S3_UPLOAD_FAIL", repr(e))
 
@@ -706,10 +719,10 @@ def main():
                 log("S3_VERIFY_FAIL", repr(e))
             s3_put_retry(f"a3-reports/{date_tag}/disagreement.json",
                          json.dumps(disagree_all, ensure_ascii=False).encode("utf-8"),
-                         "application/json")
+                         "application/json", cfg=s3_cfg_aux())
             s3_put_retry(f"a3-reports/{date_tag}/dead_letters.json",
                          json.dumps(dead_all, ensure_ascii=False).encode("utf-8"),
-                         "application/json")
+                         "application/json", cfg=s3_cfg_aux())
     else:
         log("RESUME_LATER exit", exit_code, "done", cp["done_count"], "/", total_batches)
     log("COUNTERS", json.dumps(counters, ensure_ascii=False))
