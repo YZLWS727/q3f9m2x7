@@ -22,10 +22,11 @@ BATCH_SIZE = 10
 CALL_TIMEOUT = 180
 MAX_RETRIES = 4
 DEFAULT_TIME_BUDGET_MIN = 330
-NO_PROGRESS_MIN = 30
+NO_PROGRESS_MIN = 60
 MODEL_QWEN3 = "Qwen/Qwen3-8B"
 MODEL_GLM9B = "THUDM/GLM-4-9B-0414"
 MODEL_GONE = False
+FATAL = None
 
 TAGS_DEF = {
     "#中国": "出现\"中国\"或与中国相关的各类新闻",
@@ -184,6 +185,7 @@ def call_api(model, key, sys_prompt, user_content, extra, counters):
     payload = {"model": model,
                "messages": [{"role": "system", "content": sys_prompt},
                             {"role": "user", "content": user_content}],
+               "max_tokens": 8192,
                "temperature": 0.0}
     if extra:
         payload.update(extra)
@@ -204,10 +206,12 @@ def call_api(model, key, sys_prompt, user_content, extra, counters):
             body = e.read().decode("utf-8", "replace")[:300]
             last = (e.code, body)
             counters["http"][str(e.code)] = counters["http"].get(str(e.code), 0) + 1
-            if e.code == 400 and ("20012" in body or "Model does not exist" in body):
-                global MODEL_GONE
+            if e.code in (401, 402, 403, 404) or \
+                    (e.code == 400 and ("20012" in body or "Model does not exist" in body)):
+                global MODEL_GONE, FATAL
                 MODEL_GONE = True
-                counters["model_gone"] = counters.get("model_gone", 0) + 1
+                FATAL = f"HTTP {e.code}: {body[:120]}"
+                counters["fatal"] = counters.get("fatal", 0) + 1
                 return e.code, body, time.time() - t0
             if e.code in (429, 500, 502, 503, 504):
                 time.sleep(min(60, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
@@ -231,10 +235,14 @@ def parse_result(body, batch_len):
     except Exception:
         return None, "PARSE_FAIL " + clean[:120]
     res = {}
+    seen_idx = set()
     for r in arr:
         idx = r.get("idx")
         if not isinstance(idx, int) or not (0 <= idx < batch_len):
             continue
+        if idx in seen_idx:
+            return None, f"DUP_IDX {idx}"
+        seen_idx.add(idx)
         raw_tags = r.get("tags", [])
         if not isinstance(raw_tags, list):
             raw_tags = []
@@ -497,6 +505,8 @@ def main():
     fresh = False
     _budget_raw = os.environ.get("TIME_BUDGET_MIN", "").strip()
     time_budget_min = int(_budget_raw) if _budget_raw else DEFAULT_TIME_BUDGET_MIN
+    _np_raw = os.environ.get("NO_PROGRESS_MIN", "").strip()
+    no_progress_min = int(_np_raw) if _np_raw else NO_PROGRESS_MIN
     out_dir = os.environ.get("OUT_DIR", "./output-a3")
     skip_s3 = os.environ.get("A3_SKIP_S3", "0") == "1"
     i = 0
@@ -568,6 +578,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.json")
     s3_ckpt_key = f"checkpoint-a3/{date_tag}-ckpt.json"
+    log("RUN_EVENT", os.environ.get("RUN_EVENT", "local"), "DATE", date_tag,
+        "BUDGET", time_budget_min, "NO_PROGRESS", no_progress_min,
+        "AUX_MODE", "aux" if os.environ.get("S3_AUX_BUCKET") else "main-fallback",
+        "EXPLICIT", explicit, "FRESH", fresh, "LIMIT", limit, "OUT", out_dir)
 
     if not fresh:
         if not skip_s3:
@@ -623,6 +637,7 @@ def main():
     dead_all = {}
     disagree_all = []
     exit_code = 0
+    consec_dead = 0
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
 
     for bi, batch in enumerate(batches, 1):
@@ -637,7 +652,7 @@ def main():
             log("TIME_BUDGET_HIT", "done", cp["done_count"], "/", total_batches)
             exit_code = 3
             break
-        if time.time() - last_progress > NO_PROGRESS_MIN * 60:
+        if time.time() - last_progress > no_progress_min * 60:
             log("NO_PROGRESS_HIT", "last_done", cp["done_count"])
             exit_code = 4
             break
@@ -664,11 +679,25 @@ def main():
         cp["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         save_json(ckpt_path, cp)
         last_progress = time.time()
+        dead_n = len(rec["dead"])
+        if dead_n >= max(2, len(batch) // 2):
+            consec_dead += 1
+        else:
+            consec_dead = 0
+        if consec_dead >= 5:
+            alert = os.path.join(out_dir, "PLATFORM_DEGRADED_ALERT.txt")
+            with open(alert, "w", encoding="utf-8") as f:
+                f.write("连续 5 批死信≥50%，判定硅基流动持续不可用，已中止。\n"
+                        "时间：" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n"
+                        "处置：检查硅基流动平台状态/Key/模型清单，修复后重跑（检查点已保存可续）。\n")
+            log("PLATFORM_DEGRADED_ABORT", "done", cp["done_count"], "/", total_batches)
+            exit_code = 2
+            break
         merged_all.update(rec["merged"])
         for iid in rec["dead"]:
             dead_all[iid] = {"batch": bi, "reason": "failed"}
         disagree_all.extend(rec["agree"]["disagree"])
-        if cp["done_count"] % 25 == 0 and not skip_s3:
+        if cp["done_count"] % 10 == 0 and not skip_s3:
             s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(),
                          "application/octet-stream", cfg=s3_cfg_aux())
         eta = (time.time() - start_all) / max(1, cp["done_count"]) * (total_batches - cp["done_count"])
@@ -709,21 +738,48 @@ def main():
             "dead", len(dead_all), "disagree", len(disagree_all), "elapsed", int(time.time() - start_all))
         if not skip_s3:
             md_bytes = open(md_path, "rb").read()
-            s3_put_retry(md_name, md_bytes, "text/markdown; charset=utf-8")
-            try:
-                _, got = s3_request("GET", md_name)
-                if hashlib.sha256(got).hexdigest() == hashlib.sha256(md_bytes).hexdigest():
-                    log("S3_UPLOAD_VERIFIED", md_name, len(got))
-                else:
-                    log("S3_UPLOAD_HASH_MISMATCH", md_name)
-            except Exception as e:
-                log("S3_VERIFY_FAIL", repr(e))
+            md_ok = False
+            for attempt in range(1, 4):
+                try:
+                    s3_put_retry(md_name, md_bytes, "text/markdown; charset=utf-8")
+                    _, got = s3_request("GET", md_name)
+                    if hashlib.sha256(got).hexdigest() == hashlib.sha256(md_bytes).hexdigest():
+                        md_ok = True
+                        log("S3_UPLOAD_VERIFIED", md_name, len(got), "attempt", attempt)
+                        break
+                    log("S3_UPLOAD_HASH_MISMATCH", md_name, "attempt", attempt)
+                except Exception as e:
+                    log("S3_UPLOAD_RETRY_ERR", md_name, attempt, repr(e))
+            if not md_ok:
+                log("S3_UPLOAD_FAILED_RED", md_name)
+                exit_code = 6
             s3_put_retry(f"a3-reports/{date_tag}/disagreement.json",
                          json.dumps(disagree_all, ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=s3_cfg_aux())
             s3_put_retry(f"a3-reports/{date_tag}/dead_letters.json",
                          json.dumps(dead_all, ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=s3_cfg_aux())
+        tm_sum = sum(b.get("title_mismatch", 0) for b in cp.get("batches", {}).values())
+        fallback_count = sum(1 for r in result_by_id.values()
+                             if r.get("tags") == ["#无法归类等待识别"])
+        dead_rate = dead_all.__len__() / max(1, len(items))
+        log("QUALITY_SUMMARY", "items", len(items), "dead", len(dead_all),
+            "dead_rate", round(dead_rate, 4), "fallback", fallback_count,
+            "title_mismatch", tm_sum, "disagree", len(disagree_all))
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+        if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(f"### a3 {date_tag}\n- items={len(items)} dead={len(dead_all)} "
+                        f"dead_rate={round(dead_rate, 4)} fallback={fallback_count} "
+                        f"title_mismatch={tm_sum} disagree={len(disagree_all)}\n")
+        if dead_rate > 0.01:
+            alert = os.path.join(out_dir, "QUALITY_GATE_ALERT.txt")
+            with open(alert, "w", encoding="utf-8") as f:
+                f.write(f"质量门未通过：死信率 {round(dead_rate, 4)} > 1%。\n"
+                        "时间：" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n"
+                        "处置：查看 dead_letters.json，必要时用 DeepSeek 兜底补打。\n")
+            log("QUALITY_GATE_FAILED", round(dead_rate, 4))
+            exit_code = 5
     else:
         log("RESUME_LATER exit", exit_code, "done", cp["done_count"], "/", total_batches)
     log("COUNTERS", json.dumps(counters, ensure_ascii=False))
