@@ -84,9 +84,9 @@ jobs:
           RUN_EVENT: ${{ github.event_name }}
         run: python a3_label.py ${{ inputs.force_rerun == true && '--fresh' || '' }}
 
-      - name: ds tag backstop top100
+      - name: ds tag backstop top300
         if: steps.raw.outputs.raw != '' && !cancelled()
-        timeout-minutes: 40
+        timeout-minutes: 90
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           TARGET_DATE: ${{ steps.raw.outputs.date }}
