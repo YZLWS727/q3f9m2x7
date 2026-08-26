@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""t1: DeepSeek 标签专用兜底（每日 ≤100 条，思考模式，只改标签）
+"""t1: DeepSeek 标签专用兜底（每日 ≤300 条，思考模式，只改标签）
 在 a3 成品落地后运行：读分歧清单 → 按标签 Jaccard 取前 100 → DeepSeek 只打标签
 → B 方案只改成品标签行 → 回传主桶 + 复核报告。标题/正文/情绪一律不动。
 环境变量：DEEPSEEK_API_KEY / TARGET_DATE / RAW_PATH / OUT_DIR / S3_*（与 a3_label 相同）
@@ -26,7 +26,7 @@ spec.loader.exec_module(mod)
 
 DS_BASE = "https://api.deepseek.com"
 DS_MODEL = "deepseek-v4-flash"
-CAP = 100
+CAP = 300
 TAG_JACCARD_THRESHOLD = 0.3
 BATCH_SIZE = 10
 WORKERS = 3
