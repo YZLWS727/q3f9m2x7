@@ -3,7 +3,14 @@ name: a1
 on:
   schedule:
     - cron: '2 16 * * *'
+    - cron: '2 17 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新抓取（默认 false；raw 已存在时跳过）'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build-and-sync:
@@ -14,19 +21,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: check raw exists
+        id: rawcheck
+        run: |
+          D=$(TZ=Asia/Shanghai date -d "yesterday" +%Y%m%d)
+          F=$(ls raw/*${D}*原始未打标*.md 2>/dev/null | head -1)
+          FORCE=${{ inputs.force == true && '1' || '0' }}
+          if [ -n "$F" ] && [ "$FORCE" != "1" ]; then
+            echo "RAW_ALREADY_EXISTS $F"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: deps
+        if: steps.rawcheck.outputs.skip != '1'
         run: |
           python -m pip install --upgrade pip
           pip install requests playwright
         timeout-minutes: 10
 
       - name: chromium
+        if: steps.rawcheck.outputs.skip != '1'
         run: |
           sudo apt-get update -qq
           python -m playwright install --with-deps chromium
         timeout-minutes: 15
 
       - name: mask
+        if: steps.rawcheck.outputs.skip != '1'
         env:
           M1: ${{ secrets.MASK_A }}
           M2: ${{ secrets.MASK_B }}
@@ -41,6 +64,7 @@ jobs:
           echo "::add-mask::$M5"
 
       - name: run
+        if: steps.rawcheck.outputs.skip != '1'
         timeout-minutes: 90
         run: |
           ok=0
@@ -57,7 +81,7 @@ jobs:
           PHASE: crawl
 
       - name: commit raw
-        if: always()
+        if: steps.rawcheck.outputs.skip != '1'
         run: |
           mkdir -p raw
           cp ./output/*原始未打标* raw/ 2>/dev/null || true
@@ -83,7 +107,7 @@ jobs:
           fi
 
       - name: set raw date
-        if: always()
+        if: steps.rawcheck.outputs.skip != '1'
         id: rawdate
         run: |
           F=$(ls ./output/*原始未打标* 2>/dev/null | head -1)
@@ -91,7 +115,7 @@ jobs:
           if [[ "$D" =~ ^[0-9]{8}$ ]]; then echo "date=$D" >> "$GITHUB_OUTPUT"; else echo "date=$(TZ=Asia/Shanghai date +%Y%m%d)" >> "$GITHUB_OUTPUT"; fi
 
       - name: upload raw artifact
-        if: always()
+        if: steps.rawcheck.outputs.skip != '1'
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
