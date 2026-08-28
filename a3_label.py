@@ -10,6 +10,7 @@ import hmac
 import glob
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -23,6 +24,9 @@ CALL_TIMEOUT = 180
 MAX_RETRIES = 4
 DEFAULT_TIME_BUDGET_MIN = 330
 NO_PROGRESS_MIN = 60
+FALLBACK_RETRY_LIMIT = 2     # 整批“无法归类/死信”占比过高时的整批重试次数（防静默降级）
+FALLBACK_RETRY_RATIO = 0.5   # 批次内死信占比阈值：≥50% 且至少 2 条才触发整批重试
+DEFAULT_MIN_ITEMS = 1000     # 三源/条数完整性校验默认下限（A3_MIN_ITEMS 可覆盖）
 MODEL_QWEN3 = "Qwen/Qwen3-8B"
 MODEL_GLM9B = "THUDM/GLM-4-9B-0414"
 MODEL_GONE = False
@@ -282,6 +286,29 @@ def title_consistent(r, rich_text):
     return any(b in body for b in tb)
 
 
+def validate_sources(items, min_items, out_dir):
+    """三源/条数完整性校验：总数 ≥ min_items 且新浪/格隆汇/华尔街均 >0。
+    违规写告警文件并返回 False（主流程 exit 7；A3_SKIP_MIN_CHECK=1 可豁免）。"""
+    src_count = {"#新浪24H": 0, "#格隆汇电报": 0, "#华尔街见闻": 0}
+    for it in items:
+        s = it.get("source_tag")
+        if s in src_count:
+            src_count[s] += 1
+    if len(items) >= min_items and all(v > 0 for v in src_count.values()):
+        return True
+    alert = os.path.join(out_dir, "RAW_INVALID_ALERT.txt")
+    try:
+        with open(alert, "w", encoding="utf-8") as f:
+            f.write("三源/条数完整性校验未通过。\n")
+            f.write("时间：" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+            f.write(f"items={len(items)} min_items={min_items} 三源={json.dumps(src_count, ensure_ascii=False)}\n")
+            f.write("处置：确认 a1 抓取完整性；确系特殊日（某源无内容）可设 A3_SKIP_MIN_CHECK=1 重跑。\n")
+    except Exception:
+        pass
+    log("RAW_INVALID", "items", len(items), "min", min_items, "sources", src_count)
+    return False
+
+
 def try_model(model, extra, key, batch, counters):
     sys_prompt, user_content = build_prompt(batch)
     st, body, dt = call_api(model, key, sys_prompt, user_content, extra, counters)
@@ -299,43 +326,55 @@ def try_model(model, extra, key, batch, counters):
 
 def process_batch(bi, batch, key, counters):
     ids = [it["id"] for it in batch]
-    res_q, meta_q = try_model(MODEL_QWEN3, {"enable_thinking": False}, key, batch, counters)
-    res_g, meta_g = try_model(MODEL_GLM9B, None, key, batch, counters)
-    merged = {}
-    title_mismatch = 0
-    for i, it in enumerate(batch):
-        q, g = (res_q or {}).get(i), (res_g or {}).get(i)
-        chosen, src = None, None
-        if item_ok(q) and title_consistent(q, it["rich_text"]):
-            chosen, src = q, MODEL_QWEN3
-        elif item_ok(g) and title_consistent(g, it["rich_text"]):
-            chosen, src = g, MODEL_GLM9B
-        elif item_ok(q) or item_ok(g):
-            title_mismatch += 1
-        if chosen:
-            merged[it["id"]] = dict(chosen)
-            merged[it["id"]]["_model"] = src
-
-    missing_ids = [it["id"] for it in batch if it["id"] not in merged]
-    if missing_ids:
-        log(f"BATCH {bi} SINGLE_ITEM_FALLBACK n={len(missing_ids)}")
+    retry_left = FALLBACK_RETRY_LIMIT
+    while True:
+        res_q, meta_q = try_model(MODEL_QWEN3, {"enable_thinking": False}, key, batch, counters)
+        res_g, meta_g = try_model(MODEL_GLM9B, None, key, batch, counters)
+        merged = {}
+        title_mismatch = 0
         for i, it in enumerate(batch):
-            if it["id"] in merged:
-                continue
-            sys_prompt, user_content = build_prompt([it])
-            for _ in range(2):
-                st, body, dt = call_api(MODEL_QWEN3, key, sys_prompt, user_content,
-                                        {"enable_thinking": False}, counters)
-                if st == 200:
-                    r2, err2 = parse_result(body, 1)
-                    if r2 and 0 in r2 and item_ok(r2[0]) and title_consistent(r2[0], it["rich_text"]):
-                        merged[it["id"]] = dict(r2[0])
-                        merged[it["id"]]["_model"] = MODEL_QWEN3 + "-single"
-                        break
+            q, g = (res_q or {}).get(i), (res_g or {}).get(i)
+            chosen, src = None, None
+            if item_ok(q) and title_consistent(q, it["rich_text"]):
+                chosen, src = q, MODEL_QWEN3
+            elif item_ok(g) and title_consistent(g, it["rich_text"]):
+                chosen, src = g, MODEL_GLM9B
+            elif item_ok(q) or item_ok(g):
                 title_mismatch += 1
-                time.sleep(1)
+            if chosen:
+                merged[it["id"]] = dict(chosen)
+                merged[it["id"]]["_model"] = src
 
-    dead = [iid for iid in ids if iid not in merged]
+        missing_ids = [it["id"] for it in batch if it["id"] not in merged]
+        if missing_ids:
+            log(f"BATCH {bi} SINGLE_ITEM_FALLBACK n={len(missing_ids)}")
+            for i, it in enumerate(batch):
+                if it["id"] in merged:
+                    continue
+                sys_prompt, user_content = build_prompt([it])
+                for _ in range(2):
+                    st, body, dt = call_api(MODEL_QWEN3, key, sys_prompt, user_content,
+                                            {"enable_thinking": False}, counters)
+                    if st == 200:
+                        r2, err2 = parse_result(body, 1)
+                        if r2 and 0 in r2 and item_ok(r2[0]) and title_consistent(r2[0], it["rich_text"]):
+                            merged[it["id"]] = dict(r2[0])
+                            merged[it["id"]]["_model"] = MODEL_QWEN3 + "-single"
+                            break
+                    title_mismatch += 1
+                    time.sleep(1)
+
+        dead = [iid for iid in ids if iid not in merged]
+        fallback_n = len(dead)
+        threshold = max(2, int(len(batch) * FALLBACK_RETRY_RATIO + 0.999))
+        if fallback_n >= threshold and retry_left > 0:
+            retry_left -= 1
+            backoff = min(15, 3 * (2 ** (FALLBACK_RETRY_LIMIT - retry_left))) + random.uniform(0, 2)
+            log(f"BATCH {bi} FALLBACK_RETRY dead={fallback_n}/{len(batch)} "
+                f"retry_left={retry_left} backoff={round(backoff, 1)}s")
+            time.sleep(backoff)
+            continue
+        break
     agree = {"both": 0, "tags_exact": 0, "sentiment": 0, "jaccard_sum": 0.0, "disagree": []}
     for i in range(len(batch)):
         q, g = (res_q or {}).get(i), (res_g or {}).get(i)
@@ -511,6 +550,9 @@ def main():
     time_budget_min = int(_budget_raw) if _budget_raw else DEFAULT_TIME_BUDGET_MIN
     _np_raw = os.environ.get("NO_PROGRESS_MIN", "").strip()
     no_progress_min = int(_np_raw) if _np_raw else NO_PROGRESS_MIN
+    _min_raw = os.environ.get("A3_MIN_ITEMS", "").strip()
+    min_items = int(_min_raw) if _min_raw else DEFAULT_MIN_ITEMS
+    skip_min_check = os.environ.get("A3_SKIP_MIN_CHECK", "0") == "1"
     out_dir = os.environ.get("OUT_DIR", "./output-a3")
     skip_s3 = os.environ.get("A3_SKIP_S3", "0") == "1"
     i = 0
@@ -589,13 +631,23 @@ def main():
 
     if not fresh:
         if not skip_s3:
-            data = s3_get_optional(s3_ckpt_key, s3_cfg_aux())
+            data = None
+            for _try in range(1, 4):
+                try:
+                    data = s3_get_optional(s3_ckpt_key, s3_cfg_aux())
+                    if data is not None:
+                        break
+                except Exception as e:
+                    log("CKPT_GET_RETRY", _try, repr(e))
+                    time.sleep(2 * _try)
             if data:
                 with open(ckpt_path, "wb") as f:
                     f.write(data)
                 log("CKPT_DOWNLOADED_FROM_S3", s3_ckpt_key, len(data))
 
     items = parse_raw_all(raw_path, limit)
+    if limit is None and not skip_min_check and not validate_sources(items, min_items, out_dir):
+        return 7
     sha = hashlib.sha256()
     with open(raw_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -701,7 +753,8 @@ def main():
         for iid in rec["dead"]:
             dead_all[iid] = {"batch": bi, "reason": "failed"}
         disagree_all.extend(rec["agree"]["disagree"])
-        if cp["done_count"] % 10 == 0 and not skip_s3:
+        wall_left_sec = time_budget_min * 60 - (time.time() - start_all)
+        if (cp["done_count"] % 10 == 0 or wall_left_sec < 42 * 60) and not skip_s3:
             s3_put_retry(s3_ckpt_key, open(ckpt_path, "rb").read(),
                          "application/octet-stream", cfg=s3_cfg_aux())
         eta = (time.time() - start_all) / max(1, cp["done_count"]) * (total_batches - cp["done_count"])
