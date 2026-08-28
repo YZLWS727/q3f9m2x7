@@ -1,0 +1,37 @@
+name: watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      skip_push:
+        description: '只检测不推送（测试用）'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: run watchdog
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          S3_AUX_ENDPOINT: ${{ secrets.S3_AUX_ENDPOINT }}
+          S3_AUX_BUCKET: ${{ secrets.S3_AUX_BUCKET }}
+          S3_AUX_ACCESS_KEY: ${{ secrets.S3_AUX_ACCESS_KEY }}
+          S3_AUX_SECRET_KEY: ${{ secrets.S3_AUX_SECRET_KEY }}
+          WATCHDOG_DRY: ${{ inputs.skip_push == true && '1' || '0' }}
+        run: python w1.py
