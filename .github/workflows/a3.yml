@@ -53,11 +53,41 @@ jobs:
             S=$(gh api "repos/${{ github.repository }}/actions/workflows/a1.yml/runs?per_page=1" --jq '.workflow_runs[0].status // ""' 2>/dev/null || echo "unknown")
             echo "A1_LAST_CONCLUSION=$C STATUS=$S"
             if [ "$C" = "success" ] || [ "$S" = "in_progress" ]; then
-              echo "A1 ok/running but raw not yet -> RETRY_LATER"
-              exit 0
+              if [ "$C" = "success" ]; then
+                echo "try artifact fallback"
+                mkdir -p _art
+                rm -rf _art/*
+                ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=30" --jq ".artifacts[] | select(.name == \"raw-${D}\") | .id" 2>/dev/null | head -1)
+                if [ -n "$ART_ID" ]; then
+                  echo "ARTIFACT_FOUND id=$ART_ID"
+                  curl -sL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip" -o _art/raw.zip
+                  if [ -s _art/raw.zip ]; then
+                    unzip -o -q _art/raw.zip -d _art/x
+                    AF=$(find _art/x -name "*${D}*原始未打标*.md" | head -1)
+                    if [ -n "$AF" ]; then
+                      mkdir -p raw
+                      cp "$AF" raw/
+                      F="raw/$(basename "$AF")"
+                      echo "RAW_FROM_ARTIFACT $F"
+                    else
+                      echo "ARTIFACT_MISMATCH 包内无 ${D} 对应文件"
+                    fi
+                  else
+                    echo "ARTIFACT_DOWNLOAD_FAIL"
+                  fi
+                else
+                  echo "ARTIFACT_NOT_FOUND name=raw-${D}"
+                fi
+              fi
+              if [ -z "$F" ]; then
+                echo "A1 ok/running but raw not yet -> RETRY_LATER"
+                exit 0
+              fi
+            else
+              ls raw/ | tail -5
+              exit 1
             fi
-            ls raw/ | tail -5
-            exit 1
           fi
           echo "date=$D" >> "$GITHUB_OUTPUT"
           echo "raw=$F" >> "$GITHUB_OUTPUT"
