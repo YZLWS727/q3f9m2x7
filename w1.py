@@ -20,6 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = "YZLWS727/q3f9m2x7"
 SRC_TAGS = ["#新浪24H", "#格隆汇电报", "#华尔街见闻"]
+WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 spec = importlib.util.spec_from_file_location("a3label", os.path.join(HERE, "a3_label.py"))
 mod = importlib.util.module_from_spec(spec)
@@ -28,6 +29,14 @@ spec.loader.exec_module(mod)
 
 def bj_now():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
+
+def bj_from_iso(s):
+    try:
+        dt = datetime.datetime.strptime((s or "").replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        return (dt + datetime.timedelta(hours=8)).strftime("%m-%d %H:%M")
+    except Exception:
+        return (s or "")[:16]
 
 
 def gh_get(path, token):
@@ -53,11 +62,52 @@ def workflow_state(token):
                          "status": latest.get("status") or "none",
                          "run_id": latest.get("id"),
                          "created": latest.get("created_at", "")}
+            if name == "a3" and latest.get("id"):
+                try:
+                    jobs = gh_get(f"repos/{REPO}/actions/runs/{latest['id']}/jobs?per_page=5", token)
+                    t1 = None
+                    for j in jobs.get("jobs", []):
+                        for stp in j.get("steps", []):
+                            if stp.get("name") == "ds tag backstop top300":
+                                t1 = stp.get("conclusion") or stp.get("status")
+                    out[name]["t1_step"] = t1
+                except Exception:
+                    out[name]["t1_step"] = None
         except Exception as e:
             out[name] = {"active": False, "conclusion": "error",
                          "status": "error", "run_id": None,
-                         "created": "", "err": repr(e)[:100]}
+                         "created": "", "err": repr(e)[:100], "t1_step": None}
     return out
+
+
+def t1_done_status(date_str):
+    """t1 最近结果：以辅助桶 deepseek_tag_done.json 为权威，缺失时回退 a3 步骤结论。"""
+    if not os.environ.get("S3_AUX_BUCKET"):
+        return "无状态（S3 未配置）"
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y%m%d")
+        date_tag = date_str + WEEKDAY_CN[dt.weekday()]
+        st, body = mod.s3_request("GET", f"a3-reports/{date_tag}/deepseek_tag_done.json",
+                                  cfg=mod.s3_cfg_aux())
+        if st == 200 and body:
+            d = json.loads(body.decode("utf-8", "replace"))
+            return (f"{d.get('status', '?')} 处理{d.get('processed', '?')}条 "
+                    f"改动{d.get('changed', '?')} 失败{d.get('failed', '?')} "
+                    f"({bj_from_iso(d.get('done_at', ''))})")
+        return "无 done 标记"
+    except Exception as e:
+        return "读取异常 " + repr(e)[:60]
+
+
+def recent_block(wf, t1):
+    lines = ["【最近运行】"]
+    for k in ("a1", "a3"):
+        v = wf.get(k, {})
+        concl = v.get("conclusion") or "none"
+        created = bj_from_iso(v.get("created", ""))
+        lines.append(f"{k}: {concl} ({created})")
+    lines.append("t1: " + t1)
+    return "\n".join(lines)
 
 
 def raw_sources(token, date_str):
@@ -155,6 +205,8 @@ def main():
     last_beat = state.get("last_beat", "")
     last_anomaly = state.get("anomaly_id", "")
     anomaly_id = "|".join(anomalies)
+    t1 = t1_done_status(yesterday)
+    recent = recent_block(wf, t1)
 
     if running:
         new_state = "RUNNING:" + ",".join(sorted(running))
@@ -186,6 +238,7 @@ def main():
                 msg = ("⚪ 空闲心跳", "2 小时例行状态：a1/a3 无运行，上次结论=" + str(last_concl) + "\n时间：" + now_iso)
 
     if msg:
+        msg = (msg[0], msg[1] + "\n" + recent)
         if dry:
             print("DRY_PUSH", json.dumps(msg, ensure_ascii=False), flush=True)
         elif webhook:
@@ -205,7 +258,11 @@ def main():
     print("SUMMARY", json.dumps({
         "time": now_iso, "running": running, "last_concl": last_concl,
         "anomalies": anomalies, "state": new_state,
-        "pushed": bool(msg)}, ensure_ascii=False), flush=True)
+        "pushed": bool(msg), "recent": {"a1": wf.get("a1", {}).get("conclusion"),
+                                         "a3": wf.get("a3", {}).get("conclusion"),
+                                         "a3_t1_step": wf.get("a3", {}).get("t1_step"),
+                                         "t1_done": t1}},
+       ensure_ascii=False), flush=True)
     return 0
 
 
