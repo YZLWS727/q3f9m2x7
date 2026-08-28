@@ -1,0 +1,22 @@
+name: a3-watch
+
+on:
+  schedule:
+    - cron: '17 16-23,0-15 * * *'
+    - cron: '47 16-23,0-15 * * *'
+  workflow_dispatch:
+
+jobs:
+  ensure-a3:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ensure a3 alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/a3_watch.py
