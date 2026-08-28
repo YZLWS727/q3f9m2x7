@@ -99,13 +99,25 @@ def t1_done_status(date_str):
         return "读取异常 " + repr(e)[:60]
 
 
-def recent_block(wf, t1):
+def recent_block(wf, t1, raw):
     lines = ["【最近运行】"]
     for k in ("a1", "a3"):
         v = wf.get(k, {})
         concl = v.get("conclusion") or "none"
         created = bj_from_iso(v.get("created", ""))
-        lines.append(f"{k}: {concl} ({created})")
+        if k == "a1":
+            if raw and "err" not in raw:
+                total = sum(raw.get(s, 0) for s in SRC_TAGS)
+                extra = (f"抓取{total}条（新浪{raw.get('#新浪24H', 0)}/"
+                         f"格隆汇{raw.get('#格隆汇电报', 0)}/"
+                         f"华尔街{raw.get('#华尔街见闻', 0)}）")
+            elif raw and "err" in raw:
+                extra = "抓取读取异常"
+            else:
+                extra = "抓取?条（raw未生成）"
+            lines.append(f"a1: {concl} ({created}) · {extra}")
+        else:
+            lines.append(f"{k}: {concl} ({created})")
     lines.append("t1: " + t1)
     return "\n".join(lines)
 
@@ -206,7 +218,7 @@ def main():
     last_anomaly = state.get("anomaly_id", "")
     anomaly_id = "|".join(anomalies)
     t1 = t1_done_status(yesterday)
-    recent = recent_block(wf, t1)
+    recent = recent_block(wf, t1, raw)
 
     if running:
         new_state = "RUNNING:" + ",".join(sorted(running))
@@ -261,7 +273,8 @@ def main():
         "pushed": bool(msg), "recent": {"a1": wf.get("a1", {}).get("conclusion"),
                                          "a3": wf.get("a3", {}).get("conclusion"),
                                          "a3_t1_step": wf.get("a3", {}).get("t1_step"),
-                                         "t1_done": t1}},
+                                         "t1_done": t1,
+                                         "raw_counts": raw if isinstance(raw, dict) and "err" not in raw else None}},
        ensure_ascii=False), flush=True)
     return 0
 
