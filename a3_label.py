@@ -26,7 +26,9 @@ DEFAULT_TIME_BUDGET_MIN = 330
 NO_PROGRESS_MIN = 60
 FALLBACK_RETRY_LIMIT = 2     # 整批“无法归类/死信”占比过高时的整批重试次数（防静默降级）
 FALLBACK_RETRY_RATIO = 0.5   # 批次内死信占比阈值：≥50% 且至少 2 条才触发整批重试
-DEFAULT_MIN_ITEMS = 1000     # 三源/条数完整性校验默认下限（A3_MIN_ITEMS 可覆盖）
+DEFAULT_MIN_ITEMS = 300      # 三源/条数完整性校验默认下限（A3_MIN_ITEMS 可覆盖）
+# 校准依据（2026-08-30）：周末量级显著低于平日，历史最低=8/23 周日 522 条（8/22 周六 868、8/29 周六 690）；
+# 300 既能兜住“抓取残缺”，又不会误杀正常周末。三源>0 仍强制（crawler 已兜 新浪0 exit4）。
 MODEL_QWEN3 = "Qwen/Qwen3-8B"
 MODEL_GLM9B = "THUDM/GLM-4-9B-0414"
 MODEL_GONE = False
