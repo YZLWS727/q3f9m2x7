@@ -130,7 +130,10 @@ jobs:
           S3_AUX_BUCKET: ${{ secrets.S3_AUX_BUCKET }}
           S3_AUX_ACCESS_KEY: ${{ secrets.S3_AUX_ACCESS_KEY }}
           S3_AUX_SECRET_KEY: ${{ secrets.S3_AUX_SECRET_KEY }}
-        run: python t1.py
+        run: |
+          if [ -f ./output-a3/processed_date.txt ]; then export TARGET_DATE="$(cat ./output-a3/processed_date.txt)"; fi
+          if [ -f ./output-a3/processed_raw.txt ]; then export RAW_PATH="$(cat ./output-a3/processed_raw.txt)"; fi
+          python t1.py
 
       - name: upload a3 artifacts
         if: always()
