@@ -605,6 +605,15 @@ def main():
                 if cand >= date_tag:
                     continue
                 try:
+                    st_done, _ = s3_request("GET", f"a3-reports/{cand}/a3_done.json",
+                                            cfg=s3_cfg_aux())
+                    if st_done == 200:
+                        continue  # 已有完成标记（含归档移走），不再视为未完成
+                except urllib.error.HTTPError:
+                    pass
+                except Exception:
+                    pass
+                try:
                     stx, _ = s3_request("GET", f"{cand}全网宏观信息流-硅基流动.md")
                     incomplete = stx != 200
                 except urllib.error.HTTPError as e:
@@ -624,6 +633,12 @@ def main():
             log("AUTO_RESUME_SCAN_ERR", repr(e))
 
     os.makedirs(out_dir, exist_ok=True)
+    raw_date_m = re.search(r"(\d{8})", os.path.basename(raw_path or ""))
+    proc_date = raw_date_m.group(1) if raw_date_m else target_date
+    with open(os.path.join(out_dir, "processed_date.txt"), "w", encoding="utf-8") as f:
+        f.write(proc_date)
+    with open(os.path.join(out_dir, "processed_raw.txt"), "w", encoding="utf-8") as f:
+        f.write(raw_path)
     ckpt_path = os.path.join(out_dir, "checkpoint.json")
     s3_ckpt_key = f"checkpoint-a3/{date_tag}-ckpt.json"
     log("RUN_EVENT", os.environ.get("RUN_EVENT", "local"), "DATE", date_tag,
@@ -687,6 +702,17 @@ def main():
                 log("S3_CHECK_ERR", repr(e))
         except Exception as e:
             log("S3_CHECK_ERR", repr(e))
+        try:
+            st_done, _ = s3_request("GET", f"a3-reports/{date_tag}/a3_done.json",
+                                    cfg=s3_cfg_aux())
+            if st_done == 200:
+                log("ALREADY_DONE_MARKER", date_tag)
+                return 0
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 403):
+                log("S3_MARKER_CHECK_ERR", repr(e))
+        except Exception as e:
+            log("S3_MARKER_CHECK_ERR", repr(e))
 
     start_all = time.time()
     last_progress = time.time()
@@ -817,6 +843,13 @@ def main():
                          "application/json", cfg=s3_cfg_aux())
             s3_put_retry(f"a3-reports/{date_tag}/dead_letters.json",
                          json.dumps(dead_all, ensure_ascii=False).encode("utf-8"),
+                         "application/json", cfg=s3_cfg_aux())
+            s3_put_retry(f"a3-reports/{date_tag}/a3_done.json",
+                         json.dumps({"date": date_tag, "status": "OK",
+                                     "md_sha256": hashlib.sha256(md_bytes).hexdigest(),
+                                     "items": len(items),
+                                     "done_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                    ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=s3_cfg_aux())
         tm_sum = sum(b.get("title_mismatch", 0) for b in cp.get("batches", {}).values())
         fallback_count = sum(1 for r in result_by_id.values()
