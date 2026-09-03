@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -95,6 +96,10 @@ def t1_done_status(date_str):
                     f"改动{d.get('changed', '?')} 失败{d.get('failed', '?')} "
                     f"({bj_from_iso(d.get('done_at', ''))})")
         return "无 done 标记"
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "待运行（a3 未完成或 t1 未开始）"
+        return "读取异常 " + repr(e)[:60]
     except Exception as e:
         return "读取异常 " + repr(e)[:60]
 
