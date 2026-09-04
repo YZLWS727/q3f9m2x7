@@ -163,6 +163,17 @@ def keys_ok(r, rich_text):
     return True
 
 
+def _fail_reason(res, i, it, err):
+    r = (res or {}).get(i)
+    if r is None:
+        return ("BATCH_PARSE " + str(err)[:80]) if res is None else "MISSING_IDX"
+    if not r.get("tags"):
+        return "EMPTY_TAGS"
+    if r["tags"] == ["#无法归类等待识别"]:
+        return "FALLBACK_TAG"
+    return "KEYS_MISMATCH"
+
+
 def process_batch(batch, key):
     sys_prompt, user_content = build_tag_prompt(batch)
     text, usage, dt = ds_call(sys_prompt, user_content, key)
@@ -171,26 +182,38 @@ def process_batch(batch, key):
         text, usage2, dt2 = ds_call(sys_prompt, user_content, key)
         dt += dt2
         if text is None:
-            return {}, {}, dt, usage
+            return {}, {it["id"]: "NETWORK_FAIL" for it in batch}, dt, usage
         usage = usage2
     res, err = parse_ds_content(text, len(batch))
     ok = {}
+    still = []
     for i, it in enumerate(batch):
         r = (res or {}).get(i)
         if r and tag_ok(r) and keys_ok(r, it["rich_text"]):
             ok[it["id"]] = {"tags": r["tags"]}
-    if not ok:
-        time.sleep(3)
-        text, usage2, dt2 = ds_call(sys_prompt, user_content, key)
-        dt += dt2
-        if text:
-            res, err = parse_ds_content(text, len(batch))
-            ok = {}
-            for i, it in enumerate(batch):
-                r = (res or {}).get(i)
-                if r and tag_ok(r) and keys_ok(r, it["rich_text"]):
-                    ok[it["id"]] = {"tags": r["tags"]}
-    return ok, {}, dt, usage
+        else:
+            still.append((i, it))
+    fails = {}
+    for i, it in still:
+        sp1, uc1 = build_tag_prompt([it])
+        reason = _fail_reason(res, i, it, err)
+        for _ in range(2):
+            t2, u2, d2 = ds_call(sp1, uc1, key)
+            dt += d2
+            if t2:
+                r2, err2 = parse_ds_content(t2, 1)
+                rr = (r2 or {}).get(0)
+                if rr and tag_ok(rr) and keys_ok(rr, it["rich_text"]):
+                    ok[it["id"]] = {"tags": rr["tags"]}
+                    reason = None
+                    break
+                reason = _fail_reason(r2, 0, it, err2)
+            else:
+                reason = "SINGLE_NETWORK_FAIL"
+            time.sleep(1)
+        if reason:
+            fails[it["id"]] = reason
+    return ok, fails, dt, usage
 
 
 def severity_rank(ids, cp):
@@ -336,6 +359,7 @@ def main():
 
     batches = [pending[i:i + BATCH_SIZE] for i in range(0, len(pending), BATCH_SIZE)]
     results = {}
+    failed_letters = {}
     usage_sum = {"input": 0, "output": 0}
     lat_sum = 0.0
     done_batches = 0
@@ -343,8 +367,9 @@ def main():
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futs = {ex.submit(process_batch, [items[iid] for iid in b], key): b for b in batches}
         for fut in as_completed(futs):
-            ok, _, dt, usage = fut.result()
+            ok, fails, dt, usage = fut.result()
             results.update(ok)
+            failed_letters.update(fails)
             lat_sum += dt
             if usage:
                 usage_sum["input"] += usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
@@ -354,6 +379,12 @@ def main():
                 print(f"  batches {done_batches}/{len(batches)} ok={len(results)}", flush=True)
 
     failed = max(0, len(pending) - len(results))
+    from collections import Counter as _Counter
+    reason_sum = dict(_Counter(failed_letters.values()))
+    print(f"FAIL_REASONS {reason_sum}", flush=True)
+    failed_path = os.path.join(out_dir, "deepseek_tag_failed.json")
+    with open(failed_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(failed_letters, f, ensure_ascii=False, indent=1)
     # 只改标签行，标题/情绪不动
     blocks, by_id = parse_md_blocks(md_path)
     changed = 0
@@ -399,6 +430,9 @@ def main():
         review_payload = json.dumps(review, ensure_ascii=False).encode("utf-8")
         mod.s3_put_retry(f"a3-reports/{date_tag}/deepseek_tag_review.json",
                          review_payload, "application/json", cfg=mod.s3_cfg_aux())
+        mod.s3_put_retry(f"a3-reports/{date_tag}/deepseek_tag_failed.json",
+                         json.dumps(failed_letters, ensure_ascii=False).encode("utf-8"),
+                         "application/json", cfg=mod.s3_cfg_aux())
         done = {"date": date_tag, "status": "OK", "md_sha256": patched_sha,
                 "processed": len(results), "changed": changed, "failed": failed,
                 "tokens": usage_sum, "avg_latency_s": round(lat_sum / max(1, done_batches), 1),
