@@ -34,7 +34,8 @@ def bj_now():
 
 def bj_from_iso(s):
     try:
-        dt = datetime.datetime.strptime((s or "").replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        dt = datetime.datetime.strptime(
+            (s or "").replace("Z", "").replace(" ", "T")[:19], "%Y-%m-%dT%H:%M:%S")
         return (dt + datetime.timedelta(hours=8)).strftime("%m-%d %H:%M")
     except Exception:
         return (s or "")[:16]
