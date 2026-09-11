@@ -1,21 +1,17 @@
 # -*- coding: utf-8 -*-
-"""w1: 宏观信息流看门狗 v4（DeepSeek a0 版）
-
-监控：私有仓 xinlang24H 的 a0 工作流（抓取 + DeepSeek 打标 + S3 推流）
-产出：主桶 `YYYYMMDD周X全网宏观信息流.md`（a0 为无后缀命名）
+"""w1: 宏观信息流看门狗（GitHub Actions 每 5 分钟巡检，企业微信推送）
 规则：
-- 00:00-06:30（北京）每 5 分钟心跳；
-- 06:30 后：a0 在跑 → 每 5 分钟运行心跳；空闲 → 状态变化 1 条 + 每 2 小时空闲心跳；
-- 异常（成品未生成 / a0 最近失败 / S3 同步步骤失败）状态变化时推送；
-- 状态存辅助桶 watchdog/state.json；WATCHDOG_DRY=1 只检测不推送。
-切回公共仓组合：把 REPO/WF 改回 q3f9m2x7 + a3.yml 即可（旧版逻辑在 git 历史）。
+- 00:00-06:30（北京）：每 5 分钟一条心跳；
+- 06:30 之后：有 a1/a3 在跑 → 每 5 分钟一条运行心跳；无运行 → 状态变化 1 条 + 每 2 小时一条空闲心跳；
+- 异常（raw 缺失 / 新浪源 0 条 / 最近 run 失败）在状态变化时推送；
+- 状态存辅助桶 watchdog/state.json，防刷屏；WATCHDOG_DRY=1 只检测不推送。
 """
 import datetime
 import importlib.util
 import json
 import os
+import re
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -23,9 +19,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = "YZLWS727/xinlang24H"
-WF = "a0.yml"
-PRODUCT_TAIL = "全网宏观信息流.md"
+REPO = "YZLWS727/q3f9m2x7"
+SRC_TAGS = ["#新浪24H", "#格隆汇电报", "#华尔街见闻"]
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 spec = importlib.util.spec_from_file_location("a3label", os.path.join(HERE, "a3_label.py"))
@@ -47,105 +42,113 @@ def bj_from_iso(s):
 
 
 def gh_get(path, token):
-    """GitHub API 读取（3 次重试，防瞬时 SSL/网络抖动误报）"""
-    last = None
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request("https://api.github.com/" + path, headers={
-                "Authorization": "Bearer " + token,
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "codex-watchdog"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except Exception as e:
-            last = e
-            time.sleep(2 * attempt)
-    raise last
+    req = urllib.request.Request("https://api.github.com/" + path, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "codex-watchdog"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
 def workflow_state(token):
-    out = {"active": False, "conclusion": "none", "status": "none",
-           "run_id": None, "created": "", "s3_step": None}
-    try:
-        runs = gh_get(f"repos/{REPO}/actions/workflows/{WF}/runs?per_page=3", token)
-        items = runs.get("workflow_runs", [])
-        active = any(x.get("status") in ("in_progress", "queued", "waiting", "pending")
-                     for x in items)
-        latest = items[0] if items else {}
-        out.update({"active": active,
-                    "conclusion": latest.get("conclusion") or "none",
-                    "status": latest.get("status") or "none",
-                    "run_id": latest.get("id"),
-                    "created": latest.get("created_at", "")})
-        if latest.get("id"):
-            try:
-                jobs = gh_get(f"repos/{REPO}/actions/runs/{latest['id']}/jobs?per_page=5", token)
-                for j in jobs.get("jobs", []):
-                    for stp in j.get("steps", []):
-                        nm = stp.get("name") or ""
-                        if "Rclone" in nm or "同步到 S3" in nm:
-                            out["s3_step"] = stp.get("conclusion") or stp.get("status")
-            except Exception as e:
-                out["step_err"] = repr(e)[:80]
-    except Exception as e:
-        out["err"] = repr(e)[:120]
+    out = {}
+    for name, wf in (("a1", "a1.yml"), ("a3", "a3.yml")):
+        try:
+            runs = gh_get(f"repos/{REPO}/actions/workflows/{wf}/runs?per_page=3", token)
+            items = runs.get("workflow_runs", [])
+            active = any(x.get("status") in ("in_progress", "queued", "waiting", "pending")
+                         for x in items)
+            latest = items[0] if items else {}
+            out[name] = {"active": active,
+                         "conclusion": latest.get("conclusion") or "none",
+                         "status": latest.get("status") or "none",
+                         "run_id": latest.get("id"),
+                         "created": latest.get("created_at", "")}
+            if name == "a3" and latest.get("id"):
+                try:
+                    jobs = gh_get(f"repos/{REPO}/actions/runs/{latest['id']}/jobs?per_page=5", token)
+                    t1 = None
+                    for j in jobs.get("jobs", []):
+                        for stp in j.get("steps", []):
+                            if stp.get("name") == "ds tag backstop top300":
+                                t1 = stp.get("conclusion") or stp.get("status")
+                    out[name]["t1_step"] = t1
+                except Exception:
+                    out[name]["t1_step"] = None
+        except Exception as e:
+            out[name] = {"active": False, "conclusion": "error",
+                         "status": "error", "run_id": None,
+                         "created": "", "err": repr(e)[:100], "t1_step": None}
     return out
 
 
-def product_status(date_str):
-    dt = datetime.datetime.strptime(date_str, "%Y%m%d")
-    prefix = f"{date_str}{WEEKDAY_CN[dt.weekday()]}全网宏观信息流"
-    if not os.environ.get("S3_BUCKET"):
-        return {"exists": None, "name": prefix, "note": "S3 未配置"}
+def t1_done_status(date_str):
+    """t1 最近结果：以辅助桶 deepseek_tag_done.json 为权威，缺失时回退 a3 步骤结论。"""
+    if not os.environ.get("S3_AUX_BUCKET"):
+        return "无状态（S3 未配置）"
     try:
-        keys = mod.s3_list_keys("", mod.s3_cfg())
-        hit = [k for k in keys
-               if k.rsplit("/", 1)[-1].startswith(prefix)
-               and k.rsplit("/", 1)[-1].endswith(".md")]
-        hit.sort()
-        if not hit:
-            return {"exists": False, "name": prefix, "note": "未生成"}
-        return {"exists": True, "name": hit[0].rsplit("/", 1)[-1], "key": hit[0],
-                "candidates": hit}
-    except Exception as e:
-        return {"exists": None, "name": name, "note": "读取异常 " + repr(e)[:80]}
-
-
-def product_size(key):
-    try:
-        st, body = mod.s3_request("GET", key)
+        dt = datetime.datetime.strptime(date_str, "%Y%m%d")
+        date_tag = date_str + WEEKDAY_CN[dt.weekday()]
+        st, body = mod.s3_request("GET", f"a3-reports/{date_tag}/deepseek_tag_done.json",
+                                  cfg=mod.s3_cfg_aux())
         if st == 200 and body:
-            return len(body)
-    except Exception:
-        pass
-    return None
+            d = json.loads(body.decode("utf-8", "replace"))
+            return (f"{d.get('status', '?')} 处理{d.get('processed', '?')}条 "
+                    f"改动{d.get('changed', '?')} 失败{d.get('failed', '?')} "
+                    f"({bj_from_iso(d.get('done_at', ''))})")
+        return "无 done 标记"
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "待运行（a3 未完成或 t1 未开始）"
+        return "读取异常 " + repr(e)[:60]
+    except Exception as e:
+        return "读取异常 " + repr(e)[:60]
 
 
-def recent_block(wf, product):
+def recent_block(wf, t1, raw):
     lines = ["【最近运行】"]
-    if wf.get("err"):
-        lines.append("a0: 查询异常 " + str(wf.get("err"))[:60])
-        if product.get("exists") is True:
-            sz = product.get("size")
-            lines.append("成品: 已生成" + (f"（{round(sz/1024)}KB）" if sz else ""))
-        elif product.get("exists") is False:
-            lines.append("成品: 未生成")
+    for k in ("a1", "a3"):
+        v = wf.get(k, {})
+        concl = v.get("conclusion") or "none"
+        created = bj_from_iso(v.get("created", ""))
+        if k == "a1":
+            if raw and "err" not in raw:
+                total = sum(raw.get(s, 0) for s in SRC_TAGS)
+                extra = (f"抓取{total}条（新浪{raw.get('#新浪24H', 0)}/"
+                         f"格隆汇{raw.get('#格隆汇电报', 0)}/"
+                         f"华尔街{raw.get('#华尔街见闻', 0)}）")
+            elif raw and "err" in raw:
+                extra = "抓取读取异常"
+            else:
+                extra = "抓取?条（raw未生成）"
+            lines.append(f"a1: {concl} ({created}) · {extra}")
         else:
-            lines.append("成品: " + str(product.get("note")))
-        return "\n".join(lines)
-    concl = wf.get("conclusion") or "none"
-    line = f"a0: {concl} ({bj_from_iso(wf.get('created', ''))})"
-    if wf.get("s3_step"):
-        line += " · S3同步=" + str(wf.get("s3_step"))
-    lines.append(line)
-    if product.get("exists") is True:
-        sz = product.get("size")
-        lines.append("成品: 已生成" + (f"（{round(sz/1024)}KB）" if sz else ""))
-    elif product.get("exists") is False:
-        lines.append("成品: 未生成")
-    else:
-        lines.append("成品: " + str(product.get("note")))
+            lines.append(f"{k}: {concl} ({created})")
+    lines.append("t1: " + t1)
     return "\n".join(lines)
+
+
+def raw_sources(token, date_str):
+    try:
+        items = gh_get(f"repos/{REPO}/contents/raw", token)
+        target = None
+        for it in items:
+            if it.get("type") == "file" and it.get("name", "").startswith(date_str):
+                target = it
+                break
+        if not target:
+            return None
+        if target.get("content"):
+            import base64
+            text = base64.b64decode(target["content"]).decode("utf-8", "replace")
+        else:
+            blob = gh_get(f"repos/{REPO}/git/blobs/{target['sha']}", token)
+            import base64
+            text = base64.b64decode(blob["content"]).decode("utf-8", "replace")
+        counts = {s: len(re.findall(r"### \[" + re.escape(s) + r"\]", text)) for s in SRC_TAGS}
+        return counts
+    except Exception as e:
+        return {"err": repr(e)[:100]}
 
 
 def load_state():
@@ -187,10 +190,10 @@ def push_wecom(webhook, title, content):
 
 def main():
     dry = os.environ.get("WATCHDOG_DRY", "").strip() == "1"
-    token = (os.environ.get("READ_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    token = os.environ.get("GH_TOKEN", "").strip()
     webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
     if not token:
-        print("TOKEN_MISSING", flush=True)
+        print("GH_TOKEN_MISSING", flush=True)
         return 2
     now = bj_now()
     now_iso = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -198,40 +201,33 @@ def main():
     yesterday = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
 
     wf = workflow_state(token)
-    state = load_state()
-    product = product_status(yesterday)
-    if product.get("exists") and state.get("last_product_key") != product.get("key"):
-        sz = product_size(product["key"])
-        if sz:
-            product["size"] = sz
-        state["last_product_key"] = product.get("key")
+    running = [k for k, v in wf.items() if v.get("active")]
+    last_concl = "none"
+    last_created = ""
+    for k, v in wf.items():
+        if v.get("created", "") > last_created:
+            last_created = v.get("created", "")
+            last_concl = v.get("conclusion", "none")
 
+    raw = raw_sources(token, yesterday)
     anomalies = []
-    if wf.get("err"):
-        state["err_streak"] = int(state.get("err_streak", 0)) + 1
-    else:
-        state["err_streak"] = 0
-    if int(state.get("err_streak", 0)) >= 3:
-        anomalies.append("a0 查询连续失败: " + str(wf.get("err"))[:60])
-    if wf.get("conclusion") == "failure":
-        anomalies.append("a0 最近一次运行失败")
-    if wf.get("s3_step") in ("failure", "cancelled"):
-        anomalies.append("a0 S3 同步步骤 " + str(wf.get("s3_step")))
-    if product.get("exists") is False and now.hour >= 6:
-        anomalies.append(f"{yesterday} 成品未生成")
-    elif product.get("exists") is None:
-        anomalies.append("成品检查异常: " + str(product.get("note")))
+    if raw is None:
+        anomalies.append(f"{yesterday} raw 未生成")
+    elif "err" in raw:
+        anomalies.append(f"raw 检查异常: {raw['err'][:60]}")
+    elif raw.get("#新浪24H", 0) == 0:
+        anomalies.append(f"{yesterday} 新浪源 0 条（格隆汇{raw.get('#格隆汇电报', 0)}/华尔街{raw.get('#华尔街见闻', 0)}）")
 
-    running = ["a0"] if wf.get("active") else []
+    state = load_state()
     last_state = state.get("state", "")
     last_beat = state.get("last_beat", "")
     last_anomaly = state.get("anomaly_id", "")
     anomaly_id = "|".join(anomalies)
-    recent = recent_block(wf, product)
-    last_concl = wf.get("conclusion", "none")
+    t1 = t1_done_status(yesterday)
+    recent = recent_block(wf, t1, raw)
 
     if running:
-        new_state = "RUNNING:a0"
+        new_state = "RUNNING:" + ",".join(sorted(running))
     else:
         new_state = "IDLE:" + str(last_concl)
 
@@ -240,9 +236,9 @@ def main():
         msg = ("🔴 看门狗异常", anomaly_id + "\n时间：" + now_iso)
     elif new_state != last_state:
         if running:
-            msg = ("🟢 运行中", "a0 正在运行\nrun=" + str(wf.get("run_id")) + "\n时间：" + now_iso)
+            msg = ("🟢 运行中", "、".join(running) + " 正在运行\nrun=" + str(wf[running[0]].get("run_id")) + "\n时间：" + now_iso)
         else:
-            msg = ("⚪ 空闲", "a0 无运行，上次结论=" + str(last_concl) + "\n时间：" + now_iso)
+            msg = ("⚪ 空闲", "a1/a3 均无运行，上次结论=" + str(last_concl) + "\n时间：" + now_iso)
     else:
         delta = 999999.0
         if last_beat:
@@ -253,11 +249,11 @@ def main():
         interval = 300 if (night or running) else 7200
         if delta >= interval:
             if running:
-                msg = ("🟢 运行心跳", "a0 运行中\n时间：" + now_iso)
+                msg = ("🟢 运行心跳", "、".join(running) + " 运行中\n时间：" + now_iso)
             elif night:
-                msg = ("🌙 夜间心跳", "当前空闲，a0 无运行\n时间：" + now_iso)
+                msg = ("🌙 夜间心跳", "当前空闲，a1/a3 无运行\n时间：" + now_iso)
             else:
-                msg = ("⚪ 空闲心跳", "2 小时例行状态：a0 无运行，上次结论=" + str(last_concl) + "\n时间：" + now_iso)
+                msg = ("⚪ 空闲心跳", "2 小时例行状态：a1/a3 无运行，上次结论=" + str(last_concl) + "\n时间：" + now_iso)
 
     if msg:
         msg = (msg[0], msg[1] + "\n" + recent)
@@ -279,11 +275,12 @@ def main():
 
     print("SUMMARY", json.dumps({
         "time": now_iso, "running": running, "last_concl": last_concl,
-        "anomalies": anomalies, "state": new_state, "pushed": bool(msg),
-        "product": product, "a0": {"conclusion": wf.get("conclusion"),
-                                   "status": wf.get("status"),
-                                   "s3_step": wf.get("s3_step"),
-                                   "created": wf.get("created")}},
+        "anomalies": anomalies, "state": new_state,
+        "pushed": bool(msg), "recent": {"a1": wf.get("a1", {}).get("conclusion"),
+                                         "a3": wf.get("a3", {}).get("conclusion"),
+                                         "a3_t1_step": wf.get("a3", {}).get("t1_step"),
+                                         "t1_done": t1,
+                                         "raw_counts": raw if isinstance(raw, dict) and "err" not in raw else None}},
        ensure_ascii=False), flush=True)
     return 0
 
