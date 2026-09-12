@@ -70,7 +70,7 @@ def workflow_state(token):
                     t1 = None
                     for j in jobs.get("jobs", []):
                         for stp in j.get("steps", []):
-                            if stp.get("name") == "ds tag backstop top300":
+                            if "ds tag backstop" in (stp.get("name") or ""):
                                 t1 = stp.get("conclusion") or stp.get("status")
                     out[name]["t1_step"] = t1
                 except Exception:
@@ -93,8 +93,13 @@ def t1_done_status(date_str):
                                   cfg=mod.s3_cfg_aux())
         if st == 200 and body:
             d = json.loads(body.decode("utf-8", "replace"))
+            extra = ""
+            if d.get("est_cost_cny") is not None:
+                extra += f" 估费¥{d.get('est_cost_cny')}"
+            if d.get("status") == "PARTIAL":
+                extra += f" 提前收尾({d.get('stop_reason') or '?'})"
             return (f"{d.get('status', '?')} 处理{d.get('processed', '?')}条 "
-                    f"改动{d.get('changed', '?')} 失败{d.get('failed', '?')} "
+                    f"改动{d.get('changed', '?')} 失败{d.get('failed', '?')}{extra} "
                     f"({bj_from_iso(d.get('done_at', ''))})")
         return "无 done 标记"
     except urllib.error.HTTPError as e:
