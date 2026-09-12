@@ -14,7 +14,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -26,7 +26,30 @@ spec.loader.exec_module(mod)
 
 DS_BASE = "https://api.deepseek.com"
 DS_MODEL = "deepseek-v4-flash"
-CAP = 300
+CAP = 1000
+
+
+def _env_int(name, default):
+    """可选数值型环境变量：空值/非法值回退默认值（避免 int('') 崩溃）"""
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+T1_MAX_MINUTES = _env_int("T1_MAX_MINUTES", 150)     # 硬上限：到点停止收集，已完成部分照常写回（PARTIAL）
+T1_WARN_MINUTES = _env_int("T1_WARN_MINUTES", 90)    # 软提醒：只推企业微信，不中止
+T1_STALL_MINUTES = _env_int("T1_STALL_MINUTES", 20)  # 无进展熔断：连续 N 分钟无批次完成即中止
+T1_COST_ALERT = _env_float("T1_COST_ALERT", 5.0)     # 估算成本超过该值推提醒（元）
 TAG_JACCARD_THRESHOLD = 0.3
 BATCH_SIZE = 10
 WORKERS = 3
@@ -279,6 +302,35 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def push_wecom(title, content):
+    """企业微信推送（无 webhook 时静默跳过）"""
+    hook = os.environ.get("WECOM_WEBHOOK", "").strip()
+    if not hook:
+        return False
+    try:
+        body = {"msgtype": "text", "text": {"content": (title + "\n" + content)[:2000]}}
+        req = urllib.request.Request(hook, method="POST",
+                                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type": "application/json; charset=utf-8",
+                                              "User-Agent": "t1-backstop"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"))
+        print("T1_WECOM_PUSH", resp.get("errcode"), resp.get("errmsg", ""), flush=True)
+        return True
+    except Exception as e:
+        print("T1_WECOM_PUSH_ERR", repr(e)[:150], flush=True)
+        return False
+
+
+def estimate_cost(usage):
+    """按谷价估算：输出 4 元/M、未命中输入 1 元/M、命中输入 0.02 元/M"""
+    total_in = usage.get("input", 0) or 0
+    cached = min(usage.get("cached", 0) or 0, total_in)
+    miss = max(0, total_in - cached)
+    out = usage.get("output", 0) or 0
+    return out / 1e6 * 4.0 + miss / 1e6 * 1.0 + cached / 1e6 * 0.02
+
+
 def main():
     dry = "--dry-run" in sys.argv
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
@@ -360,28 +412,79 @@ def main():
     batches = [pending[i:i + BATCH_SIZE] for i in range(0, len(pending), BATCH_SIZE)]
     results = {}
     failed_letters = {}
-    usage_sum = {"input": 0, "output": 0}
+    usage_sum = {"input": 0, "output": 0, "cached": 0}
     lat_sum = 0.0
     done_batches = 0
-    print(f"DS_TAG_BACKSTOP {date_tag} pending={len(pending)} batches={len(batches)}", flush=True)
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(process_batch, [items[iid] for iid in b], key): b for b in batches}
-        for fut in as_completed(futs):
-            ok, fails, dt, usage = fut.result()
-            results.update(ok)
-            failed_letters.update(fails)
-            lat_sum += dt
-            if usage:
-                usage_sum["input"] += usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
-                usage_sum["output"] += usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
-            done_batches += 1
-            if done_batches % 5 == 0 or done_batches == len(batches):
-                print(f"  batches {done_batches}/{len(batches)} ok={len(results)}", flush=True)
+    stop_reason = ""
+    warn_sent = False
+    start_ts = time.time()
+    last_progress_ts = start_ts
+    max_sec = max(1, T1_MAX_MINUTES) * 60
+    warn_sec = max(1, T1_WARN_MINUTES) * 60
+    stall_sec = max(1, T1_STALL_MINUTES) * 60
+    print(f"DS_TAG_BACKSTOP {date_tag} pending={len(pending)} batches={len(batches)} "
+          f"max={T1_MAX_MINUTES}min warn={T1_WARN_MINUTES}min stall={T1_STALL_MINUTES}min", flush=True)
+    ex = ThreadPoolExecutor(max_workers=WORKERS)
+    futs = {ex.submit(process_batch, [items[iid] for iid in b], key): b for b in batches}
+    pending_futs = set(futs)
+    try:
+        while pending_futs and not stop_reason:
+            try:
+                for fut in as_completed(pending_futs, timeout=max(5, min(60, stall_sec))):
+                    pending_futs.discard(fut)
+                    ok, fails, dt, usage = fut.result()
+                    results.update(ok)
+                    failed_letters.update(fails)
+                    lat_sum += dt
+                    if usage:
+                        usage_sum["input"] += usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                        usage_sum["output"] += usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                        detail = usage.get("input_tokens_details") or {}
+                        usage_sum["cached"] += (detail.get("cached_tokens", 0) or
+                                                usage.get("prompt_cache_hit_tokens", 0) or 0)
+                    done_batches += 1
+                    last_progress_ts = time.time()
+                    if done_batches % 5 == 0 or done_batches == len(batches):
+                        print(f"  batches {done_batches}/{len(batches)} ok={len(results)} "
+                              f"elapsed={int(time.time()-start_ts)}s", flush=True)
+                    elapsed_now = time.time() - start_ts
+                    if (not warn_sent) and elapsed_now >= warn_sec and elapsed_now < max_sec:
+                        warn_sent = True
+                        push_wecom("🟡 t1 运行偏慢",
+                                   f"{date_tag} 已运行 {T1_WARN_MINUTES} 分钟，完成 {done_batches}/{len(batches)} 批、"
+                                   f"{len(results)} 条；继续处理，暂不中止（硬上限 {T1_MAX_MINUTES} 分钟）。")
+                        print("T1_WARN_PUSHED", flush=True)
+                    if elapsed_now > max_sec:
+                        stop_reason = "TIME_BUDGET"
+                        break
+                    if time.time() - last_progress_ts > stall_sec:
+                        stop_reason = "NO_PROGRESS"
+                        break
+            except FuturesTimeout:
+                pass
+            if stop_reason:
+                break
+            if time.time() - start_ts > max_sec:
+                stop_reason = "TIME_BUDGET"
+            elif time.time() - last_progress_ts > stall_sec:
+                stop_reason = "NO_PROGRESS"
+    finally:
+        for f in list(pending_futs):
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+    if stop_reason:
+        print(f"T1_STOP reason={stop_reason} done_batches={done_batches}/{len(batches)} "
+              f"processed={len(results)}", flush=True)
 
     failed = max(0, len(pending) - len(results))
     from collections import Counter as _Counter
     reason_sum = dict(_Counter(failed_letters.values()))
+    est_cost = estimate_cost(usage_sum)
+    elapsed_s = int(time.time() - start_ts)
+    status = "PARTIAL" if stop_reason else "OK"
     print(f"FAIL_REASONS {reason_sum}", flush=True)
+    print(f"T1_SUMMARY status={status} stop={stop_reason or 'none'} elapsed={elapsed_s}s "
+          f"processed={len(results)}/{len(pending)} est_cost={est_cost:.2f}CNY", flush=True)
     failed_path = os.path.join(out_dir, "deepseek_tag_failed.json")
     with open(failed_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(failed_letters, f, ensure_ascii=False, indent=1)
@@ -408,7 +511,7 @@ def main():
         f.write(patched_text)
     patched_sha = sha256_file(md_path)
     print(f"DS_PATCHED {date_tag} processed={len(results)} changed={changed} "
-          f"failed={failed} tokens={usage_sum} md_sha={patched_sha[:16]}", flush=True)
+          f"failed={failed} tokens={usage_sum} est_cost={est_cost:.2f} md_sha={patched_sha[:16]}", flush=True)
 
     if not skip_s3:
         data = open(md_path, "rb").read()
@@ -433,16 +536,28 @@ def main():
         mod.s3_put_retry(f"a3-reports/{date_tag}/deepseek_tag_failed.json",
                          json.dumps(failed_letters, ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=mod.s3_cfg_aux())
-        done = {"date": date_tag, "status": "OK", "md_sha256": patched_sha,
-                "processed": len(results), "changed": changed, "failed": failed,
-                "tokens": usage_sum, "avg_latency_s": round(lat_sum / max(1, done_batches), 1),
+        done = {"date": date_tag, "status": status, "stop_reason": stop_reason,
+                "md_sha256": patched_sha, "cap": CAP, "pool": len(pool),
+                "requested": len(pending), "processed": len(results), "changed": changed,
+                "failed": failed, "tokens": usage_sum, "est_cost_cny": round(est_cost, 2),
+                "elapsed_s": elapsed_s, "avg_latency_s": round(lat_sum / max(1, done_batches), 1),
                 "done_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         mod.s3_put_retry(f"a3-reports/{date_tag}/deepseek_tag_done.json",
                          json.dumps(done, ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=mod.s3_cfg_aux())
         print("DS_TAG_DONE", json.dumps(done, ensure_ascii=False), flush=True)
+        if stop_reason:
+            push_wecom("🟠 t1 提前收尾",
+                       f"{date_tag} 原因={stop_reason}（硬上限 {T1_MAX_MINUTES} 分钟/无进展 {T1_STALL_MINUTES} 分钟）；"
+                       f"已完成 {len(results)}/{len(pending)} 条，其余保留硅基标签；成品已回传主桶。")
+        if est_cost > T1_COST_ALERT:
+            push_wecom("💰 t1 成本提醒",
+                       f"{date_tag} 本次估算 {est_cost:.2f} 元（阈值 {T1_COST_ALERT:.1f} 元），处理 {len(results)} 条；"
+                       f"tokens 输入{usage_sum.get('input',0)}/输出{usage_sum.get('output',0)}。")
     else:
         print("DS_TAG_DONE_LOCAL_SKIP_S3", flush=True)
+        if stop_reason:
+            print(f"T1_PARTIAL_LOCAL stop={stop_reason}", flush=True)
     return 0
 
 
