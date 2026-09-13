@@ -50,7 +50,8 @@ T1_MAX_MINUTES = _env_int("T1_MAX_MINUTES", 150)     # 硬上限：到点停止�
 T1_WARN_MINUTES = _env_int("T1_WARN_MINUTES", 90)    # 软提醒：只推企业微信，不中止
 T1_STALL_MINUTES = _env_int("T1_STALL_MINUTES", 20)  # 无进展熔断：连续 N 分钟无批次完成即中止
 T1_COST_ALERT = _env_float("T1_COST_ALERT", 5.0)     # 估算成本超过该值推提醒（元）
-TAG_JACCARD_THRESHOLD = 0.3
+TAG_JACCARD_THRESHOLD = _env_float("T1_TAG_THRESHOLD", 0.40)  # 标签分歧阈值（0.4 实际含 0.333 档）
+T1_TAG_MAX = _env_int("T1_TAG_MAX", 8)                        # 单条标签上限
 BATCH_SIZE = 10
 WORKERS = 3
 
@@ -100,13 +101,12 @@ def build_tag_prompt(batch):
 【核心纪律：绝对白名单制】
 你输出的所有标签，必须 100% 存在于下方的《预设标签库》中，一字不差。严禁自创标签。
 
-【多标签硬性纪律（最高优先级）】
-1. 优先输出最相关的 4~6 个标签，允许 3~6 个；宁缺毋滥，绝对禁止为了凑数添加弱相关或泛化标签；
+【多标签纪律（最高优先级）】
+1. 目标是输出 4~8 个标签：请系统检查并覆盖新闻里所有明确相关的维度——地区/国别、市场（股市/债市/汇率/大宗商品等）、主体（央行/政府/公司/机构）、行业、政策、地缘政治、社会与认知维度（认知偏差、情绪、趋势预测等）；只有确实相关维度很少时才允许少于 4 个；绝不允许为凑数添加明显不相关的标签；
 2. 所有标签必须一字不差来自《预设标签库》，绝对禁止自创、改写、合并或新增任何白名单之外的标签；
-3. 每条输出 3~6 个标签；只有 1~2 个明确相关标签时允许少于 3 个，绝不拿“金融流动性/宏观政策/行业动态/无法归类等待识别”等当万能填充；
-4. 标签上限 6 个，绝不超过；
-5. 一条都找不到匹配时，只输出 ["#无法归类等待识别"]；该标签必须独占（唯一），禁止与其他任何标签同时出现；
-6. 输出前逐条自检：每条标签数必须在 3~6 之间（优先 4~6）；#无法归类等待识别 只能单独出现；#期权 仅当正文明确出现 期权/看涨期权/看跌期权/认购/认沽/行权/隐含波动率/到期/做市 等期权要素时才使用。
+3. 标签上限 8 个，绝不超过；
+4. 一条都找不到匹配时，只输出 ["#无法归类等待识别"]；该标签必须独占（唯一），禁止与其他任何标签同时出现；
+5. 输出前逐条自检：标签数不超过 8 个；#无法归类等待识别 只能单独出现；#期权 仅当正文明确出现 期权/看涨期权/看跌期权/认购/认沽/行权/隐含波动率/到期/做市 等期权要素时才使用。
 
 【对齐纪律（最高优先级）】
 - 必须严格按输入顺序输出，idx 从 0 到 N-1，每个只用一次，禁止跳号、重复或错位；
@@ -120,7 +120,7 @@ def build_tag_prompt(batch):
 [ {{"idx": 0, "tags": ["#美国", "#债务和债券市场", "#金融流动性", "#宏观政策"], "keys": ["美联储", "国债"]}} ]
 
 【输出前强制检查】
-①每条标签数必须在 3~6 之间（优先 4~6）；不足时允许 1~2 个，但禁止为凑数添加弱相关、泛化或“无法归类等待识别”标签；
+①每条标签数最多 8 个（通常 4~8 个）；禁止为凑数添加弱相关、泛化或“无法归类等待识别”标签；
 ②#无法归类等待识别 仅当所有其他标签都不符合时作为唯一标签输出，禁止与其他标签共存；
 ③#期权 仅在正文明确出现期权要素时使用，禁止作为金融类填充标签；
 ④idx 必须覆盖 0~N-1 且不重复、不错位；
@@ -153,7 +153,7 @@ def parse_ds_content(content, batch_len):
             if t in mod.VALID_TAGS_SET and t not in st:
                 st.add(t)
                 tags.append(t)
-        tags = tags[:6]
+        tags = tags[:T1_TAG_MAX]
         if "#无法归类等待识别" in tags and len(tags) > 1:
             tags = [t for t in tags if t != "#无法归类等待识别"]
         if not tags:
@@ -239,7 +239,9 @@ def process_batch(batch, key):
     return ok, fails, dt, usage
 
 
-def severity_rank(ids, cp):
+def pool_from_checkpoint(cp, threshold):
+    """从检查点全量枚举条目（含 Qwen3 与 GLM9B 双方标签），按 Jaccard 升序返回。
+    不再依赖 disagreement.json 的 0.3 口径，便于独立调整兜底阈值。"""
     qmap, gmap = {}, {}
     for brec in cp.get("batches", {}).values():
         ids_b = brec.get("items", [])
@@ -250,13 +252,13 @@ def severity_rank(ids, cp):
             if int(k) < len(ids_b):
                 gmap[ids_b[int(k)]] = v
     scored = []
-    for iid in ids:
+    for iid in set(list(qmap.keys()) + list(gmap.keys())):
         q, g = qmap.get(iid), gmap.get(iid)
         if not (q and g):
             continue
         a, b = set(q.get("tags", [])), set(g.get("tags", []))
         j = len(a & b) / max(1, len(a | b))
-        if j >= TAG_JACCARD_THRESHOLD:
+        if j >= threshold:
             continue
         scored.append((j, iid))
     scored.sort(key=lambda x: x[0])
@@ -358,7 +360,7 @@ def main():
 
     ids = json.load(open(dis_path, encoding="utf-8"))
     cp = json.load(open(ckpt_path, encoding="utf-8"))
-    pool = severity_rank(ids, cp)
+    pool = pool_from_checkpoint(cp, TAG_JACCARD_THRESHOLD)
     ordered = pool[:CAP]
     items = {it["id"]: it for it in mod.parse_raw_all(raw_path)}
     pending = [iid for iid in ordered if iid in items]
@@ -372,6 +374,7 @@ def main():
 
     if dry:
         print("DRYRUN", json.dumps({"date": date_tag, "disagreement": len(ids),
+                                    "threshold": TAG_JACCARD_THRESHOLD, "tag_max": T1_TAG_MAX,
                                     "tag_pool": len(pool), "cap": len(ordered),
                                     "found": len(pending), "md_sha256": md_sha[:16]},
                                    ensure_ascii=False), flush=True)
@@ -499,13 +502,20 @@ def main():
         if bi is None:
             continue
         old_block = blocks[bi]
+        old_line = block_tag_line(old_block)
+        src = items[iid]["source_tag"]
+        old_ai = {x for x in old_line.split() if x.startswith("#") and x != src}
+        new_ai = {x for x in ds["tags"] if x != src}
+        if old_ai == new_ai:
+            # 标签集合一致、仅顺序不同：不改写，避免无意义 churn
+            review.append({"id": iid, "sf_tags": old_line, "ds_tags": ds["tags"],
+                           "changed": False, "skip_reason": "SET_EQUAL"})
+            continue
         new_block = patch_block(old_block, items[iid], ds)
-        same = block_tag_line(old_block).strip() == block_tag_line(new_block).strip()
-        if not same:
-            changed += 1
+        changed += 1
         blocks[bi] = new_block
-        review.append({"id": iid, "sf_tags": block_tag_line(old_block),
-                       "ds_tags": ds["tags"], "changed": not same})
+        review.append({"id": iid, "sf_tags": old_line,
+                       "ds_tags": ds["tags"], "changed": True})
     patched_text = "".join(blocks)
     with open(md_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(patched_text)
@@ -537,7 +547,8 @@ def main():
                          json.dumps(failed_letters, ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=mod.s3_cfg_aux())
         done = {"date": date_tag, "status": status, "stop_reason": stop_reason,
-                "md_sha256": patched_sha, "cap": CAP, "pool": len(pool),
+                "md_sha256": patched_sha, "cap": CAP, "threshold": TAG_JACCARD_THRESHOLD,
+                "tag_max": T1_TAG_MAX, "pool": len(pool),
                 "requested": len(pending), "processed": len(results), "changed": changed,
                 "failed": failed, "tokens": usage_sum, "est_cost_cny": round(est_cost, 2),
                 "elapsed_s": elapsed_s, "avg_latency_s": round(lat_sum / max(1, done_batches), 1),
