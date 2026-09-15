@@ -50,20 +50,24 @@ T1_MAX_MINUTES = _env_int("T1_MAX_MINUTES", 150)     # 硬上限：到点停止�
 T1_WARN_MINUTES = _env_int("T1_WARN_MINUTES", 90)    # 软提醒：只推企业微信，不中止
 T1_STALL_MINUTES = _env_int("T1_STALL_MINUTES", 20)  # 无进展熔断：连续 N 分钟无批次完成即中止
 T1_COST_ALERT = _env_float("T1_COST_ALERT", 5.0)     # 估算成本超过该值推提醒（元）
+DS_TIMEOUT = _env_int("T1_DS_TIMEOUT", 90)         # 单次请求超时（秒）：卡死时快速失败，避免整批拖死
+DS_ATTEMPTS = _env_int("T1_DS_ATTEMPTS", 3)        # 单次调用重试次数
+
 TAG_JACCARD_THRESHOLD = _env_float("T1_TAG_THRESHOLD", 0.40)  # 标签分歧阈值（0.4 实际含 0.333 档）
 T1_TAG_MAX = _env_int("T1_TAG_MAX", 8)                        # 单条标签上限
 BATCH_SIZE = 10
 WORKERS = 3
 
 
-def ds_call(sys_prompt, user_content, key, timeout=300):
+def ds_call(sys_prompt, user_content, key, timeout=None):
+    timeout = timeout or DS_TIMEOUT
     payload = {"model": DS_MODEL,
                "input": [{"role": "system", "content": sys_prompt},
                          {"role": "user", "content": user_content}],
                "max_output_tokens": 8192,
                "temperature": 0.0}
     last = None
-    for attempt in range(1, 5):
+    for attempt in range(1, DS_ATTEMPTS + 1):
         t0 = time.time()
         try:
             req = urllib.request.Request(DS_BASE + "/v1/responses", method="POST")
@@ -85,7 +89,7 @@ def ds_call(sys_prompt, user_content, key, timeout=300):
         except urllib.error.HTTPError as e:
             last = repr(e)
             if e.code in (429, 500, 502, 503, 504):
-                time.sleep(min(45, 5 * (2 ** (attempt - 1))))
+                time.sleep(min(20, 5 * (2 ** (attempt - 1))))
                 continue
             return None, {}, time.time() - t0
         except Exception as e:
@@ -387,9 +391,11 @@ def main():
                                              mod.s3_cfg_aux())
             if done_bytes:
                 done = json.loads(done_bytes.decode("utf-8", "replace"))
-                if done.get("md_sha256") == md_sha:
+                if done.get("md_sha256") == md_sha and (done.get("status") or "OK") == "OK":
                     print("SKIP_ALREADY_DONE", date_tag, flush=True)
                     return 0
+                if done.get("status") == "PARTIAL":
+                    print("PREV_PARTIAL_RETRY_ALLOWED", date_tag, done.get("stop_reason") or "", flush=True)
         except Exception as e:
             print("DONE_CHECK_ERR", repr(e), flush=True)
 
@@ -420,6 +426,7 @@ def main():
     done_batches = 0
     stop_reason = ""
     warn_sent = False
+    fail_log_count = 0
     start_ts = time.time()
     last_progress_ts = start_ts
     max_sec = max(1, T1_MAX_MINUTES) * 60
@@ -447,6 +454,9 @@ def main():
                                                 usage.get("prompt_cache_hit_tokens", 0) or 0)
                     done_batches += 1
                     last_progress_ts = time.time()
+                    if fails and fail_log_count < 20:
+                        fail_log_count += 1
+                        print(f"  batch_fail n={len(fails)} e.g. {list(fails.items())[:2]}", flush=True)
                     if done_batches % 5 == 0 or done_batches == len(batches):
                         print(f"  batches {done_batches}/{len(batches)} ok={len(results)} "
                               f"elapsed={int(time.time()-start_ts)}s", flush=True)
@@ -476,8 +486,12 @@ def main():
             f.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
     if stop_reason:
+        for _b in batches:
+            for _iid in _b:
+                if _iid not in results and _iid not in failed_letters:
+                    failed_letters[_iid] = "ABORTED_" + stop_reason
         print(f"T1_STOP reason={stop_reason} done_batches={done_batches}/{len(batches)} "
-              f"processed={len(results)}", flush=True)
+              f"processed={len(results)} aborted={len(failed_letters)}", flush=True)
 
     failed = max(0, len(pending) - len(results))
     from collections import Counter as _Counter
