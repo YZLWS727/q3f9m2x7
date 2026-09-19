@@ -288,6 +288,35 @@ def title_consistent(r, rich_text):
     return any(b in body for b in tb)
 
 
+def _title_bigrams(t):
+    return {t[i:i + 2] for i in range(len(t) - 1)
+            if any(c.isalnum() or '\u4e00' <= c <= '\u9fff' for c in t[i:i + 2])}
+
+
+def _title_numbers(t):
+    return {n for n in re.findall(r"\d+(?:\.\d+)?", t) if len(n) >= 2}
+
+
+def title_suspect(r, rich_text):
+    """强守卫（2026-09-19 新增）：判定标题"疑似串题/失真"，只用于触发单条重跑，不作为淘汰条件。
+
+    任一成立即可疑：
+      ① 标题与正文共享的内容 2-gram 少于 2 个（原守卫只要 ≥1，通用词如"科技"即可蒙混过关）；
+      ② 标题中的数字（≥2 位）未在正文中出现（如标题写"14亿"、正文只有"194.88亿"）。
+    若单条重跑仍可疑，则保留原结果，避免把可用结果打成死信。"""
+    t = re.sub(r"\s+", "", (r or {}).get("summary_title", ""))
+    if len(t) < 6:
+        return False
+    body = re.sub(r"\s+", "", rich_text or "")
+    shared = sum(1 for b in _title_bigrams(t) if b in body)
+    if shared < 2:
+        return True
+    for n in _title_numbers(t):
+        if n not in body:
+            return True
+    return False
+
+
 def validate_sources(items, min_items, out_dir):
     """三源/条数完整性校验：总数 ≥ min_items 且新浪/格隆汇/华尔街均 >0。
     违规写告警文件并返回 False（主流程 exit 7；A3_SKIP_MIN_CHECK=1 可豁免）。"""
@@ -329,6 +358,9 @@ def try_model(model, extra, key, batch, counters):
 def process_batch(bi, batch, key, counters):
     ids = [it["id"] for it in batch]
     retry_left = FALLBACK_RETRY_LIMIT
+    suspect_total = 0
+    suspect_repaired = 0
+    suspect_kept = 0
     while True:
         res_q, meta_q = try_model(MODEL_QWEN3, {"enable_thinking": False}, key, batch, counters)
         res_g, meta_g = try_model(MODEL_GLM9B, None, key, batch, counters)
@@ -346,6 +378,38 @@ def process_batch(bi, batch, key, counters):
             if chosen:
                 merged[it["id"]] = dict(chosen)
                 merged[it["id"]]["_model"] = src
+
+        suspect_ids = [it["id"] for it in batch
+                       if it["id"] in merged and title_suspect(merged[it["id"]], it["rich_text"])]
+        if suspect_ids:
+            suspect_total += len(suspect_ids)
+            log(f"BATCH {bi} TITLE_SUSPECT n={len(suspect_ids)}")
+            for it in batch:
+                if it["id"] not in suspect_ids:
+                    continue
+                sys_prompt, user_content = build_prompt([it])
+                fallback = merged[it["id"]]
+                repaired = False
+                for _ in range(2):
+                    st, body, dt = call_api(MODEL_QWEN3, key, sys_prompt, user_content,
+                                            {"enable_thinking": False}, counters)
+                    if st == 200:
+                        r2, err2 = parse_result(body, 1)
+                        cand = (r2 or {}).get(0)
+                        if cand and item_ok(cand) and title_consistent(cand, it["rich_text"]):
+                            if not title_suspect(cand, it["rich_text"]):
+                                fixed = dict(cand)
+                                fixed["_model"] = MODEL_QWEN3 + "-guardfix"
+                                merged[it["id"]] = fixed
+                                repaired = True
+                                break
+                            fallback = dict(cand)
+                    time.sleep(1)
+                if repaired:
+                    suspect_repaired += 1
+                else:
+                    merged[it["id"]] = fallback
+                    suspect_kept += 1
 
         missing_ids = [it["id"] for it in batch if it["id"] not in merged]
         if missing_ids:
@@ -396,6 +460,9 @@ def process_batch(bi, batch, key, counters):
             "glm9b_items": {str(i): r for i, r in (res_g or {}).items()},
             "merged": merged, "dead": dead, "qwen_meta": meta_q, "glm_meta": meta_g,
             "title_mismatch": title_mismatch,
+            "title_suspect": suspect_total,
+            "title_suspect_repaired": suspect_repaired,
+            "title_suspect_kept": suspect_kept,
             "agree": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in agree.items()},
             "done": True}
 
@@ -852,18 +919,24 @@ def main():
                                     ensure_ascii=False).encode("utf-8"),
                          "application/json", cfg=s3_cfg_aux())
         tm_sum = sum(b.get("title_mismatch", 0) for b in cp.get("batches", {}).values())
+        ts_sum = sum(b.get("title_suspect", 0) for b in cp.get("batches", {}).values())
+        ts_fix = sum(b.get("title_suspect_repaired", 0) for b in cp.get("batches", {}).values())
+        ts_keep = sum(b.get("title_suspect_kept", 0) for b in cp.get("batches", {}).values())
         fallback_count = sum(1 for r in result_by_id.values()
                              if r.get("tags") == ["#无法归类等待识别"])
         dead_rate = dead_all.__len__() / max(1, len(items))
         log("QUALITY_SUMMARY", "items", len(items), "dead", len(dead_all),
             "dead_rate", round(dead_rate, 4), "fallback", fallback_count,
-            "title_mismatch", tm_sum, "disagree", len(disagree_all))
+            "title_mismatch", tm_sum, "title_suspect", ts_sum,
+            "suspect_repaired", ts_fix, "suspect_kept", ts_keep, "disagree", len(disagree_all))
         summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
         if summary_path:
             with open(summary_path, "a", encoding="utf-8") as f:
                 f.write(f"### a3 {date_tag}\n- items={len(items)} dead={len(dead_all)} "
                         f"dead_rate={round(dead_rate, 4)} fallback={fallback_count} "
-                        f"title_mismatch={tm_sum} disagree={len(disagree_all)}\n")
+                        f"title_mismatch={tm_sum} title_suspect={ts_sum} "
+                        f"suspect_repaired={ts_fix} suspect_kept={ts_keep} "
+                        f"disagree={len(disagree_all)}\n")
         if dead_rate > 0.01:
             alert = os.path.join(out_dir, "QUALITY_GATE_ALERT.txt")
             with open(alert, "w", encoding="utf-8") as f:
