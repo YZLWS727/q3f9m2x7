@@ -20,8 +20,20 @@ import urllib.request
 
 BASE = "https://api.siliconflow.cn/v1"
 BATCH_SIZE = 10
-CALL_TIMEOUT = 180
-MAX_RETRIES = 4
+def _env_int(name, default):
+    """可选数值型环境变量：空值/非法值回退默认（避免 int('') 崩溃）"""
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+# 2026-09-24：超时/重试收紧（与 t1 v4 同思路）。原 180s x 4 次重试 + 60s 退避上限时，
+# 单批最坏可拖 ~24 分钟，与 60 分钟"无进展熔断"的余量只有 2.5 倍（9/23 打标因此异常缓慢）。
+# 现改为 90s x 3 次 + 20s 退避上限，单批最坏约 9.5 分钟，与熔断阈值保持 ~6 倍余量。
+CALL_TIMEOUT = _env_int("A3_CALL_TIMEOUT", 90)
+MAX_RETRIES = _env_int("A3_MAX_RETRIES", 3)
 DEFAULT_TIME_BUDGET_MIN = 330
 NO_PROGRESS_MIN = 60
 FALLBACK_RETRY_LIMIT = 2     # 整批“无法归类/死信”占比过高时的整批重试次数（防静默降级）
@@ -222,13 +234,13 @@ def call_api(model, key, sys_prompt, user_content, extra, counters):
                 counters["fatal"] = counters.get("fatal", 0) + 1
                 return e.code, body, time.time() - t0
             if e.code in (429, 500, 502, 503, 504):
-                time.sleep(min(60, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
+                time.sleep(min(20, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
                 continue
             return e.code, body, time.time() - t0
         except Exception as e:
             last = (-1, repr(e)[:200])
             counters["net"] += 1
-            time.sleep(min(60, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
+            time.sleep(min(20, 3 * (2 ** (attempt - 1))) + (attempt * 0.7))
     return last[0], last[1], 0
 
 
